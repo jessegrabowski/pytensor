@@ -210,6 +210,7 @@ class SolveBase(Op):
         "b_ndim",
         "overwrite_a",
         "overwrite_b",
+        "on_error",
     )
 
     def __init__(
@@ -220,6 +221,7 @@ class SolveBase(Op):
         b_ndim,
         overwrite_a=False,
         overwrite_b=False,
+        on_error: Literal["raise", "nan"] = "raise",
     ):
         self.lower = lower
         self.check_finite = check_finite
@@ -231,6 +233,8 @@ class SolveBase(Op):
             self.gufunc_signature = "(m,m),(m,n)->(m,n)"
         self.overwrite_a = overwrite_a
         self.overwrite_b = overwrite_b
+        self.on_error = on_error
+
         destroy_map = {}
         if self.overwrite_a and self.overwrite_b:
             # An output destroying two inputs is not yet supported
@@ -289,10 +293,16 @@ class SolveBase(Op):
         A, b = inputs
 
         c = outputs[0]
+
         # C is a scalar representing the entire graph
         # `output_gradients` is (dC/dc,)
         # We need to return (dC/d[inv(A)], dC/db)
         c_bar = output_gradients[0]
+
+        if self.on_error == "nan":
+            ok = ~ptm.any(ptm.isnan(c))
+            c = ptb.switch(ok, c, 1)
+            c_bar = ptb.switch(ok, c_bar, 1)
 
         trans_solve_op = type(self)(
             **{
@@ -304,7 +314,10 @@ class SolveBase(Op):
         # force outer product if vector second input
         A_bar = -ptm.outer(b_bar, c) if c.ndim == 1 else -b_bar.dot(c.T)
 
-        return [A_bar, b_bar]
+        if self.on_error == "nan":
+            return [ptb.switch(ok, A_bar, np.nan), ptb.switch(ok, b_bar, np.nan)]
+        else:
+            return [A_bar, b_bar]
 
 
 def _default_b_ndim(b, b_ndim):
@@ -389,6 +402,7 @@ class SolveTriangular(SolveBase):
         "check_finite",
         "b_ndim",
         "overwrite_b",
+        "on_error",
     )
 
     def __init__(self, *, trans=0, unit_diagonal=False, **kwargs):
@@ -400,15 +414,25 @@ class SolveTriangular(SolveBase):
 
     def perform(self, node, inputs, outputs):
         A, b = inputs
-        outputs[0][0] = scipy.linalg.solve_triangular(
-            A,
-            b,
-            lower=self.lower,
-            trans=self.trans,
-            unit_diagonal=self.unit_diagonal,
-            check_finite=self.check_finite,
-            overwrite_b=self.overwrite_b,
-        )
+
+        try:
+            outputs[0][0] = scipy.linalg.solve_triangular(
+                A,
+                b,
+                lower=self.lower,
+                trans=self.trans,
+                unit_diagonal=self.unit_diagonal,
+                check_finite=self.check_finite,
+                overwrite_b=self.overwrite_b,
+            )
+
+        except ValueError | scipy.linalg.LinAlgError:
+            if self.on_error == "raise":
+                raise
+            else:
+                outputs[0][0] = np.full(
+                    b.shape, np.nan, dtype=node.outputs[0].type.dtype
+                )
 
     def L_op(self, inputs, outputs, output_gradients):
         res = super().L_op(inputs, outputs, output_gradients)
@@ -438,6 +462,7 @@ def solve_triangular(
     unit_diagonal: bool = False,
     check_finite: bool = True,
     b_ndim: int | None = None,
+    on_error: Literal["raise", "nan"] = "raise",
 ) -> TensorVariable:
     """Solve the equation `a x = b` for `x`, assuming `a` is a triangular matrix.
 
@@ -473,6 +498,7 @@ def solve_triangular(
             unit_diagonal=unit_diagonal,
             check_finite=check_finite,
             b_ndim=b_ndim,
+            on_error=on_error,
         )
     )(a, b)
     return cast(TensorVariable, ret)
@@ -490,6 +516,7 @@ class Solve(SolveBase):
         "b_ndim",
         "overwrite_a",
         "overwrite_b",
+        "on_error",
     )
 
     def __init__(self, *, assume_a="gen", **kwargs):
@@ -501,15 +528,24 @@ class Solve(SolveBase):
 
     def perform(self, node, inputs, outputs):
         a, b = inputs
-        outputs[0][0] = scipy.linalg.solve(
-            a=a,
-            b=b,
-            lower=self.lower,
-            check_finite=self.check_finite,
-            assume_a=self.assume_a,
-            overwrite_a=self.overwrite_a,
-            overwrite_b=self.overwrite_b,
-        )
+
+        try:
+            outputs[0][0] = scipy.linalg.solve(
+                a=a,
+                b=b,
+                lower=self.lower,
+                check_finite=self.check_finite,
+                assume_a=self.assume_a,
+                overwrite_a=self.overwrite_a,
+                overwrite_b=self.overwrite_b,
+            )
+        except ValueError | scipy.linalg.LinAlgError:
+            if self.on_error == "raise":
+                raise
+            else:
+                outputs[0][0] = np.full(
+                    b.shape, np.nan, dtype=node.outputs[0].type.dtype
+                )
 
     def inplace_on_inputs(self, allowed_inplace_inputs: list[int]) -> "Op":
         if not allowed_inplace_inputs:
@@ -534,6 +570,7 @@ def solve(
     lower=False,
     check_finite=True,
     b_ndim: int | None = None,
+    on_error: Literal["raise", "nan"] = "raise",
 ):
     """Solves the linear equation set ``a * x = b`` for the unknown ``x`` for square ``a`` matrix.
 
@@ -581,6 +618,7 @@ def solve(
             check_finite=check_finite,
             assume_a=assume_a,
             b_ndim=b_ndim,
+            on_error=on_error,
         )
     )(a, b)
 

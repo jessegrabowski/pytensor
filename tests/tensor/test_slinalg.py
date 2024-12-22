@@ -200,7 +200,7 @@ class TestSolveBase(utt.InferShapeTester):
         y = SolveBase(b_ndim=2)(A, b)
         assert (
             y.__repr__()
-            == "SolveBase{lower=False, check_finite=True, b_ndim=2, overwrite_a=False, overwrite_b=False}.0"
+            == "SolveBase{lower=False, check_finite=True, b_ndim=2, overwrite_a=False, overwrite_b=False, on_error='raise'}.0"
         )
 
 
