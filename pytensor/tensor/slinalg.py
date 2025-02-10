@@ -295,15 +295,31 @@ class SolveBase(Op):
         # We need to return (dC/d[inv(A)], dC/db)
         c_bar = output_gradients[0]
 
-        trans_solve_op = type(self)(
-            **{
-                k: (not getattr(self, k) if k == "lower" else getattr(self, k))
-                for k in self.__props__
-            }
-        )
-        b_bar = trans_solve_op(A.T, c_bar)
+        solve_args = {k: getattr(self, k) for k in self.__props__}
+
+        # Some solvers can solve A.T x = b directly, without ever computing the transpose
+        has_trans = "transposed" in self.__props__
+
+        if has_trans:
+            # If the solver can do transposed solves, we do the opposite of the forward in the reverse. If we solved
+            # C = solve(A, b), then b_bar = solve(A.T, c_bar). If we solved C = solve(A.T, b), then
+            # b_bar = solve(A, c_bar)
+            solve_args["transposed"] = not solve_args["transposed"]
+            solve_op = type(self)(**solve_args)
+            b_bar = solve_op(A, c_bar)
+
+        else:
+            # Otherwise, we have to actually do the transpose of whatever was given
+            solve_op = type(self)(**solve_args)
+            b_bar = solve_op(A.T, c_bar)
+
         # force outer product if vector second input
-        A_bar = -ptm.outer(b_bar, c) if c.ndim == 1 else -b_bar.dot(c.T)
+        A_bar = -ptm.outer(b_bar, c) if c.ndim == 1 else -b_bar @ c.T
+
+        if has_trans and not solve_args["transposed"]:
+            # If we did a transposed solve in the forward pass, the program is expecting the
+            # gradients of A.T, not A
+            A_bar = A_bar.T
 
         return [A_bar, b_bar]
 
@@ -369,7 +385,7 @@ def cho_solve(c_and_lower, b, *, check_finite=True, b_ndim: int | None = None):
         Whether to check that the input matrices contain only finite numbers.
         Disabling may give a performance gain, but may result in problems
         (crashes, non-termination) if the inputs do contain infinities or NaNs.
-        b_ndim : int
+    b_ndim : int
         Whether the core case of b is a vector (1) or matrix (2).
         This will influence how batched dimensions are interpreted.
     """
@@ -497,13 +513,13 @@ class Solve(SolveBase):
     def __init__(self, *, assume_a="gen", transposed=False, **kwargs):
         if assume_a not in ("gen", "sym", "her", "pos"):
             raise ValueError(f"{assume_a} is not a recognized matrix structure")
-
         super().__init__(**kwargs)
         self.assume_a = assume_a
         self.transposed = transposed
 
     def perform(self, node, inputs, outputs):
         a, b = inputs
+
         outputs[0][0] = scipy.linalg.solve(
             a=a,
             b=b,
@@ -1182,4 +1198,5 @@ __all__ = [
     "solve_discrete_are",
     "solve_triangular",
     "block_diag",
+    "cho_solve",
 ]

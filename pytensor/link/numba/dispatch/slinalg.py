@@ -40,7 +40,7 @@ def _solve_check(n, info, lamch=False, rcond=None):
         E = _xlamch("E")
         if rcond < E:
             # TODO: This should be a warning, but we can't raise warnings in numba mode
-            print(
+            print(  # noqa: T201
                 "Ill-conditioned matrix, rcond=", rcond, ", result may not be accurate."
             )
 
