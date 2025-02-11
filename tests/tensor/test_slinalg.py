@@ -21,6 +21,7 @@ from pytensor.tensor.slinalg import (
     cholesky,
     eigvalsh,
     expm,
+    lu,
     solve,
     solve_continuous_lyapunov,
     solve_discrete_are,
@@ -435,6 +436,67 @@ class TestCholeskySolve(utt.InferShapeTester):
             x_result = fn(A_val.astype(A_dtype), b_val.astype(b_dtype))
 
             assert x.dtype == x_result.dtype, (A_dtype, b_dtype)
+
+
+@pytest.mark.parametrize("permute_l", [True, False], ids=["permute_l", "no_permute_l"])
+@pytest.mark.parametrize("p_indices", [True, False], ids=["p_indices", "no_p_indices"])
+@pytest.mark.parametrize("complex", [False, True], ids=["real", "complex"])
+def test_lu_decomposition(permute_l, p_indices, complex):
+    dtype = config.floatX if not complex else f"complex{int(config.floatX[-2:]) * 2}"
+    A = tensor("A", shape=(None, None), dtype=dtype)
+    out = lu(A, permute_l=permute_l, p_indices=p_indices)
+
+    f = pytensor.function([A], out)
+
+    rng = np.random.default_rng(utt.fetch_seed())
+    x = rng.normal(size=(5, 5)).astype(config.floatX)
+    if complex:
+        x = x + 1j * rng.normal(size=(5, 5)).astype(config.floatX)
+
+    out = f(x)
+
+    if permute_l:
+        PL, U = out
+        x_rebuilt = PL @ U
+    elif p_indices:
+        p, L, U = out
+        P = np.eye(5)[p]
+        x_rebuilt = P @ L @ U
+    else:
+        P, L, U = out
+        x_rebuilt = P @ L @ U
+
+    np.testing.assert_allclose(x, x_rebuilt)
+    scipy_out = scipy.linalg.lu(x, permute_l=permute_l, p_indices=p_indices)
+
+    for a, b in zip(out, scipy_out, strict=True):
+        np.testing.assert_allclose(a, b)
+
+
+@pytest.mark.parametrize("grad_case", [0, 1, 2], ids=["U_only", "L_only", "U_and_L"])
+@pytest.mark.parametrize("permute_l", [True, False])
+@pytest.mark.parametrize("p_indices", [True, False])
+def test_lu_grad(grad_case, permute_l, p_indices):
+    rng = np.random.default_rng(utt.fetch_seed())
+    A_value = rng.normal(size=(5, 5))
+
+    def f_pt(A):
+        out = lu(A, permute_l=permute_l, p_indices=p_indices)
+
+        if permute_l:
+            L, U = out
+        else:
+            _, L, U = out
+
+        match grad_case:
+            case 0:
+                return U.sum()
+            case 1:
+                return L.sum()
+            case 2:
+                return U.sum() + L.sum()
+
+    utt.verify_grad(f_pt, [A_value], rng=rng)
 
 
 def test_cho_solve():
