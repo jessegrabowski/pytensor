@@ -2,7 +2,7 @@ import logging
 import warnings
 from collections.abc import Sequence
 from functools import reduce
-from typing import Literal, cast, Sequence
+from typing import Literal, cast
 
 import numpy as np
 import scipy.linalg as scipy_linalg
@@ -426,8 +426,8 @@ class LU(Op):
         real_dtype = "f" if np.dtype(x.type.dtype).char in "fF" else "d"
         p_dtype = "int32" if self.p_indices else np.dtype(real_dtype)
 
-        L = tensor(shape=x.type.shape, dtype=real_dtype)
-        U = tensor(shape=x.type.shape, dtype=real_dtype)
+        L = tensor(shape=x.type.shape, dtype=x.type.dtype)
+        U = tensor(shape=x.type.shape, dtype=x.type.dtype)
 
         if self.permute_l:
             # In this case, L is actually P @ L
@@ -497,7 +497,7 @@ class LU(Op):
             p, L, U = outputs
 
             # TODO: rewrite to p_indices = False for graphs where we need to compute the gradient
-            P = pt.eye(A.shape[0])[p]
+            P = pt.eye(A.shape[-1])[p]
             _, L_bar, U_bar = output_grads
         else:
             P, L, U = outputs
@@ -556,11 +556,15 @@ def lu(
     U: TensorVariable
         Upper triangular matrix
     """
-    return cast(
+    op = cast(
         tuple[TensorVariable, TensorVariable, TensorVariable]
         | tuple[TensorVariable, TensorVariable],
-        LU(permute_l=permute_l, check_finite=check_finite, p_indices=p_indices)(a),
+        Blockwise(
+            LU(permute_l=permute_l, check_finite=check_finite, p_indices=p_indices)
+        ),
     )
+
+    return op(a)
 
 
 class SolveTriangular(SolveBase):

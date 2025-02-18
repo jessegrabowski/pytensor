@@ -477,30 +477,38 @@ class TestCholeskySolve(utt.InferShapeTester):
 @pytest.mark.parametrize("permute_l", [True, False], ids=["permute_l", "no_permute_l"])
 @pytest.mark.parametrize("p_indices", [True, False], ids=["p_indices", "no_p_indices"])
 @pytest.mark.parametrize("complex", [False, True], ids=["real", "complex"])
-def test_lu_decomposition(permute_l, p_indices, complex):
+@pytest.mark.parametrize("shape", [(3, 5, 5), (5, 5)], ids=["batched", "not_batched"])
+def test_lu_decomposition(
+    permute_l: bool, p_indices: bool, complex: bool, shape: tuple[int]
+):
     dtype = config.floatX if not complex else f"complex{int(config.floatX[-2:]) * 2}"
-    A = tensor("A", shape=(None, None), dtype=dtype)
+
+    A = tensor("A", shape=shape, dtype=dtype)
     out = lu(A, permute_l=permute_l, p_indices=p_indices)
 
     f = pytensor.function([A], out)
 
     rng = np.random.default_rng(utt.fetch_seed())
-    x = rng.normal(size=(5, 5)).astype(config.floatX)
+    x = rng.normal(size=shape).astype(config.floatX)
     if complex:
-        x = x + 1j * rng.normal(size=(5, 5)).astype(config.floatX)
+        x = x + 1j * rng.normal(size=shape).astype(config.floatX)
 
     out = f(x)
 
     if permute_l:
         PL, U = out
-        x_rebuilt = PL @ U
     elif p_indices:
         p, L, U = out
-        P = np.eye(5)[p]
-        x_rebuilt = P @ L @ U
+        if len(shape) == 2:
+            P = np.eye(5)[p]
+        else:
+            P = np.stack([np.eye(5)[idx] for idx in p])
+        PL = np.einsum("...nk,...km->...nm", P, L)
     else:
         P, L, U = out
-        x_rebuilt = P @ L @ U
+        PL = np.einsum("...nk,...km->...nm", P, L)
+
+    x_rebuilt = np.einsum("...nk,...km->...nm", PL, U)
 
     np.testing.assert_allclose(x, x_rebuilt)
     scipy_out = scipy.linalg.lu(x, permute_l=permute_l, p_indices=p_indices)
@@ -512,9 +520,10 @@ def test_lu_decomposition(permute_l, p_indices, complex):
 @pytest.mark.parametrize("grad_case", [0, 1, 2], ids=["U_only", "L_only", "U_and_L"])
 @pytest.mark.parametrize("permute_l", [True, False])
 @pytest.mark.parametrize("p_indices", [True, False])
-def test_lu_grad(grad_case, permute_l, p_indices):
+@pytest.mark.parametrize("shape", [(3, 5, 5), (5, 5)], ids=["batched", "not_batched"])
+def test_lu_grad(grad_case, permute_l, p_indices, shape):
     rng = np.random.default_rng(utt.fetch_seed())
-    A_value = rng.normal(size=(5, 5))
+    A_value = rng.normal(size=shape)
 
     def f_pt(A):
         out = lu(A, permute_l=permute_l, p_indices=p_indices)
