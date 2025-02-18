@@ -391,6 +391,8 @@ class LU(Op):
     def __init__(
         self, *, permute_l=False, overwrite_a=False, check_finite=True, p_indices=False
     ):
+        if permute_l and p_indices:
+            raise ValueError("Only one of permute_l and p_indices can be True")
         self.permute_l = permute_l
         self.check_finite = check_finite
         self.p_indices = p_indices
@@ -432,12 +434,12 @@ class LU(Op):
         if self.permute_l:
             # In this case, L is actually P @ L
             return Apply(self, inputs=[x], outputs=[L, U])
-        elif self.p_indices:
-            p = tensor(shape=(x.type.shape[0],), dtype=p_dtype)
-            return Apply(self, inputs=[x], outputs=[p, L, U])
-        else:
-            P = tensor(shape=x.type.shape, dtype=p_dtype)
-            return Apply(self, inputs=[x], outputs=[P, L, U])
+        if self.p_indices:
+            p_indices = tensor(shape=(x.type.shape[0],), dtype=p_dtype)
+            return Apply(self, inputs=[x], outputs=[p_indices, L, U])
+
+        P = tensor(shape=x.type.shape, dtype=p_dtype)
+        return Apply(self, inputs=[x], outputs=[P, L, U])
 
     def perform(self, node, inputs, outputs):
         [A] = inputs
@@ -479,29 +481,23 @@ class LU(Op):
         A = cast(TensorVariable, A)
 
         if self.permute_l:
-            PL_bar, U_bar = output_grads
+            # P has no gradient contribution (by assumption...), so PL_bar is the same as L_bar
+            L_bar, U_bar = output_grads
 
             # TODO: Rewrite into permute_l = False for graphs where we need to compute the gradient
-            P, L, U = lu(  # type: ignore
+            # We need L, not PL. It's not possible to recover it from PL, though. So we need to do a new forward pass
+            P_or_indices, L, U = lu(  # type: ignore
                 A, permute_l=False, check_finite=self.check_finite, p_indices=False
             )
 
-            # Permutation matrix is orthogonal
-            L_bar = (
-                P.T @ PL_bar
-                if not isinstance(PL_bar.type, DisconnectedType)
-                else pt.zeros_like(A)
-            )
-
-        elif self.p_indices:
-            p, L, U = outputs
-
-            # TODO: rewrite to p_indices = False for graphs where we need to compute the gradient
-            P = pt.eye(A.shape[-1])[p]
-            _, L_bar, U_bar = output_grads
         else:
-            P, L, U = outputs
+            # In both other cases, there are 3 outputs. The first output will either be the permutation index itself,
+            # or indices that can be used to reconstruct the permutation matrix.
+            P_or_indices, L, U = outputs
             _, L_bar, U_bar = output_grads
+
+        L = pytensor.printing.Print("L")(L)
+        U = pytensor.printing.Print("U")(U)
 
         L_bar = (
             L_bar if not isinstance(L_bar.type, DisconnectedType) else pt.zeros_like(A)
@@ -513,9 +509,17 @@ class LU(Op):
         x1 = ptb.tril(L.T @ L_bar, k=-1)
         x2 = ptb.triu(U_bar @ U.T)
 
-        L_inv_x = solve_triangular(L.T, x1 + x2, lower=False, unit_diagonal=True)
-        A_bar = P @ solve_triangular(U, L_inv_x.T, lower=False).T
+        LT_inv_x = solve_triangular(L.T, x1 + x2, lower=False, unit_diagonal=True)
 
+        # Where B = P.T @ A is a change of variable to avoid the permutation matrix in the gradient derivation
+        B_bar = solve_triangular(U, LT_inv_x.T, lower=False).T
+
+        if not self.p_indices:
+            A_bar = P_or_indices @ B_bar
+        else:
+            A_bar = B_bar[P_or_indices]
+
+        A_bar = pytensor.printing.Print("A_bar")(A_bar)
         return [A_bar]
 
 
@@ -556,15 +560,13 @@ def lu(
     U: TensorVariable
         Upper triangular matrix
     """
-    op = cast(
+    return cast(
         tuple[TensorVariable, TensorVariable, TensorVariable]
         | tuple[TensorVariable, TensorVariable],
         Blockwise(
-            LU(permute_l=permute_l, check_finite=check_finite, p_indices=p_indices)
-        ),
+            LU(permute_l=permute_l, p_indices=p_indices, check_finite=check_finite)
+        )(a),
     )
-
-    return op(a)
 
 
 class SolveTriangular(SolveBase):

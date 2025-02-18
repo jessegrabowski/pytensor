@@ -474,8 +474,11 @@ class TestCholeskySolve(utt.InferShapeTester):
             assert x.dtype == x_result.dtype, (A_dtype, b_dtype)
 
 
-@pytest.mark.parametrize("permute_l", [True, False], ids=["permute_l", "no_permute_l"])
-@pytest.mark.parametrize("p_indices", [True, False], ids=["p_indices", "no_p_indices"])
+@pytest.mark.parametrize(
+    "permute_l, p_indices",
+    [(False, True), (True, False), (False, False)],
+    ids=["PL", "p_indices", "P"],
+)
 @pytest.mark.parametrize("complex", [False, True], ids=["real", "complex"])
 @pytest.mark.parametrize("shape", [(3, 5, 5), (5, 5)], ids=["batched", "not_batched"])
 def test_lu_decomposition(
@@ -517,29 +520,30 @@ def test_lu_decomposition(
         np.testing.assert_allclose(a, b)
 
 
-@pytest.mark.parametrize("grad_case", [0, 1, 2], ids=["U_only", "L_only", "U_and_L"])
-@pytest.mark.parametrize("permute_l", [True, False])
-@pytest.mark.parametrize("p_indices", [True, False])
+@pytest.mark.parametrize(
+    "grad_case", [0, 1, 2], ids=["dU_only", "dL_only", "dU_and_dL"]
+)
+@pytest.mark.parametrize(
+    "permute_l, p_indices",
+    [(True, False), (False, True), (False, False)],
+    ids=["PL", "p_indices", "P"],
+)
 @pytest.mark.parametrize("shape", [(3, 5, 5), (5, 5)], ids=["batched", "not_batched"])
 def test_lu_grad(grad_case, permute_l, p_indices, shape):
     rng = np.random.default_rng(utt.fetch_seed())
-    A_value = rng.normal(size=shape)
+    A_value = rng.normal(size=shape).astype(config.floatX)
 
     def f_pt(A):
-        out = lu(A, permute_l=permute_l, p_indices=p_indices)
-
-        if permute_l:
-            L, U = out
-        else:
-            _, L, U = out
+        # lu returns either (P_or_index, L, U) or (PL, U), depending on settings
+        out = lu(A, permute_l=permute_l, p_indices=p_indices, check_finite=False)
 
         match grad_case:
             case 0:
-                return U.sum()
+                return out[-1].sum()
             case 1:
-                return L.sum()
+                return out[-2].sum()
             case 2:
-                return U.sum() + L.sum()
+                return out[-1].sum() + out[-2].sum()
 
     utt.verify_grad(f_pt, [A_value], rng=rng)
 
