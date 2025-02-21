@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 import pytensor.tensor as pt
+import tests.unittest_tools as utt
 from pytensor.configdefaults import config
 from pytensor.tensor import nlinalg as pt_nlinalg
 from pytensor.tensor import slinalg as pt_slinalg
@@ -103,28 +104,72 @@ def test_jax_basic():
     )
 
 
-@pytest.mark.parametrize("check_finite", [False, True])
+@pytest.mark.parametrize(
+    "b_shape",
+    [(5, 1), (5, 5), (5,)],
+    ids=["b_col_vec", "b_matrix", "b_vec"],
+)
+@pytest.mark.parametrize("assume_a", ["gen", "sym", "pos"], ids=str)
+@pytest.mark.parametrize("lower", [False, True])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_jax_solve(b_shape: tuple[int], assume_a, lower, transposed):
+    rng = np.random.default_rng(utt.fetch_seed())
+
+    A = pt.tensor("A", shape=(5, 5))
+    b = pt.tensor("B", shape=b_shape)
+
+    def A_func(x):
+        if assume_a == "sym":
+            return (x + x.T) / 2
+        if assume_a == "pos":
+            return x @ x.T
+        return x
+
+    out = pt_slinalg.solve(
+        A_func(A), b, assume_a=assume_a, lower=lower, transposed=transposed
+    )
+
+    A_val = rng.normal(size=(5, 5)).astype(config.floatX)
+    b_val = rng.normal(size=b_shape).astype(config.floatX)
+
+    compare_jax_and_py(
+        [A, b],
+        [out],
+        [A_val, b_val],
+    )
+
+
+@pytest.mark.parametrize(
+    "b_shape", [(5, 1), (5, 5), (5,)], ids=["b_col_vec", "b_matrix", "b_vec"]
+)
 @pytest.mark.parametrize("lower", [False, True])
 @pytest.mark.parametrize("trans", [0, 1, 2])
-def test_jax_SolveTriangular(trans, lower, check_finite):
-    x = matrix("x")
-    b = vector("b")
+@pytest.mark.parametrize("unit_diagonal", [False, True])
+def test_jax_SolveTriangular(b_shape: tuple[int], lower, trans, unit_diagonal):
+    rng = np.random.default_rng(utt.fetch_seed())
+
+    A = pt.tensor("A", shape=(5, 5))
+    b = pt.tensor("B", shape=b_shape)
+
+    def A_func(x):
+        x = x @ x.T
+        x = pt.linalg.cholesky(x, lower=lower)
+        if unit_diagonal:
+            x = pt.fill_diagonal(x, 1.0)
+
+        return x
+
+    A_val = rng.normal(size=(5, 5)).astype(config.floatX)
+    b_val = rng.normal(size=b_shape).astype(config.floatX)
 
     out = pt_slinalg.solve_triangular(
-        x,
+        A_func(A),
         b,
         trans=trans,
         lower=lower,
-        check_finite=check_finite,
+        unit_diagonal=unit_diagonal,
     )
-    compare_jax_and_py(
-        [x, b],
-        [out],
-        [
-            np.eye(10).astype(config.floatX),
-            np.arange(10).astype(config.floatX),
-        ],
-    )
+    compare_jax_and_py([A, b], [out], [A_val, b_val])
 
 
 def test_jax_block_diag():
