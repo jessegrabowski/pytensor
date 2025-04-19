@@ -3,7 +3,7 @@ import warnings
 import mlx.core as mx
 
 from pytensor.link.mlx.dispatch.basic import mlx_funcify
-from pytensor.tensor.slinalg import Solve
+from pytensor.tensor.slinalg import Solve, SolveTriangular
 
 
 @mlx_funcify.register(Solve)
@@ -22,3 +22,18 @@ def mlx_funcify_Solve(op, node, **kwargs):
         return mx.linalg.solve(a, b, stream=mx.cpu)
 
     return solve
+
+
+@mlx_funcify.register(SolveTriangular)
+def mlx_funcify_SolveTriangular(op, **kwargs):
+    lower = op.lower
+
+    def solve_triangular(A, b):
+        return mx.linalg.solve_triangular(
+            A,
+            b,
+            upper=not lower,
+            stream=mx.cpu,  # MLX only supports solve_triangular on CPU
+        )
+
+    return solve_triangular
