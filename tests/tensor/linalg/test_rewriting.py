@@ -258,6 +258,7 @@ def test_decomposition_reused_preserves_check_finite(assume_a, counter):
     "lower_first", [True, False], ids=["lower_first", "upper_first"]
 )
 def test_cho_solve_handles_lower_flags(lower_first):
+    rewrite_name = reuse_decomposition_multiple_solves.__name__
     A = tensor("A", shape=(2, None))
     b = tensor("b", shape=(2,))
 
@@ -268,9 +269,14 @@ def test_cho_solve_handles_lower_flags(lower_first):
     dx2_dA = grad(x2.sum(), A)
 
     fn = function([A, b], [x1, dx1_dA, x2, dx2_dA])
+    fn_no_rewrite = function(
+        [A, b],
+        [x1, dx1_dA, x2, dx2_dA],
+        mode=get_default_mode().excluding(rewrite_name),
+    )
 
     rng = np.random.default_rng()
-    L_values = rng.normal(size=(2, 2))
+    L_values = rng.normal(size=(2, 2)).astype(config.floatX)
     A_values = L_values @ L_values.T  # Ensure A is positive definite
 
     if lower_first:
@@ -278,12 +284,20 @@ def test_cho_solve_handles_lower_flags(lower_first):
     else:
         A_values[1, 0] = np.nan
 
-    b_values = rng.normal(size=(2,))
+    b_values = rng.normal(size=(2,)).astype(config.floatX)
 
     # This computation should not raise an error, and none of them should be NaN
     res = fn(A_values, b_values)
-    for x in res:
+    expected_res = fn_no_rewrite(A_values, b_values)
+
+    for x, expected_x in zip(res, expected_res):
         assert np.isfinite(x).all()
+        np.testing.assert_allclose(
+            x,
+            expected_x,
+            atol=1e-6 if config.floatX == "float64" else 1e-3,
+            rtol=1e-6 if config.floatX == "float64" else 1e-3,
+        )
 
     # If we put the NaN in the wrong place, it should raise an error
     with pytest.raises(np.linalg.LinAlgError):
