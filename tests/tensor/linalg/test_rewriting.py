@@ -112,7 +112,7 @@ def test_lu_decomposition_reused_forward_and_gradient(assume_a, counter, transpo
     np.testing.assert_allclose(resg0, resg1, rtol=rtol)
 
 
-@pytest.mark.parametrize("transposed", (False, True))
+@pytest.mark.parametrize("transposed", (False, True), ids=["no_trans", "trans"])
 @pytest.mark.parametrize(
     "assume_a, counter",
     (
@@ -120,6 +120,7 @@ def test_lu_decomposition_reused_forward_and_gradient(assume_a, counter, transpo
         ("tridiagonal", TriDiagLUOpCounter),
         ("pos", CholeskyOpCounter),
     ),
+    ids=["assume_gen", "assume_tridiagonal", "assume_pos"],
 )
 def test_lu_decomposition_reused_blockwise(assume_a, counter, transposed):
     rewrite_name = reuse_decomposition_multiple_solves.__name__
@@ -251,3 +252,39 @@ def test_decomposition_reused_preserves_check_finite(assume_a, counter):
         assert fn_opt(A_valid, b1_valid * np.nan, b2_valid)
     with pytest.raises(ValueError, match="array must not contain infs or NaNs"):
         assert fn_opt(A_valid * np.nan, b1_valid, b2_valid)
+
+
+@pytest.mark.parametrize(
+    "lower_first", [True, False], ids=["lower_first", "upper_first"]
+)
+def test_cho_solve_handles_lower_flags(lower_first):
+    A = tensor("A", shape=(2, None))
+    b = tensor("b", shape=(2,))
+
+    x1 = solve(A, b, assume_a="pos", lower=lower_first, check_finite=False)
+    x2 = solve(A.mT, b, assume_a="pos", lower=not lower_first, check_finite=False)
+
+    dx1_dA = grad(x1.sum(), A)
+    dx2_dA = grad(x2.sum(), A)
+
+    fn = function([A, b], [x1, dx1_dA, x2, dx2_dA])
+
+    rng = np.random.default_rng()
+    L_values = rng.normal(size=(2, 2))
+    A_values = L_values @ L_values.T  # Ensure A is positive definite
+
+    if lower_first:
+        A_values[0, 1] = np.nan
+    else:
+        A_values[1, 0] = np.nan
+
+    b_values = rng.normal(size=(2,))
+
+    # This computation should not raise an error, and none of them should be NaN
+    res = fn(A_values, b_values)
+    for x in res:
+        assert np.isfinite(x).all()
+
+    # If we put the NaN in the wrong place, it should raise an error
+    with pytest.raises(np.linalg.LinAlgError):
+        fn(A_values.T, b_values)
