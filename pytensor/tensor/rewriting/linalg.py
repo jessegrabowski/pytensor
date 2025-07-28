@@ -588,9 +588,11 @@ def svd_uv_merge(fgraph, node):
 @node_rewriter([Blockwise])
 def rewrite_inv_inv(fgraph, node):
     """
-    This rewrite takes advantage of the fact that if there are two consecutive inverse operations (inv(inv(input))), we get back our original input without having to compute inverse once.
+    This rewrite takes advantage of the fact that if there are two consecutive inverse operations (inv(inv(input))),
+    we get back our original input without having to compute inverse once.
 
-    Here, we check for direct inverse operations (inv/pinv)  and allows for any combination of these "inverse" nodes to be simply rewritten.
+    Here, we check for direct inverse operations (inv/pinv)  and allows for any combination of these "inverse" nodes to
+    be simply rewritten.
 
     Parameters
     ----------
@@ -853,6 +855,59 @@ def rewrite_det_kronecker(fgraph, node):
     det_final = prod([dets[i] ** (prod_sizes / sizes[i]) for i in range(2)])
 
     return [det_final]
+
+
+@register_canonicalize
+@register_stabilize
+@node_rewriter([Blockwise])
+def rewrite_solve_kron_to_solve(fgraph, node):
+    """
+    Given a linear system of the form:
+
+    .. math:
+
+        (A \\otimes B) x = y
+
+    Define :math:`\text{vec}(x)` as a column-wise raveling operation (``x.reshape(-1, order='F")`` in code). Further,
+     define :math:`y = \text{vec}(Y)`. Then the above expression can be rewritten as:
+
+    ..math::
+
+        x = \text{vec}(B^{-1} Y A^{-T})
+
+    Eliminating the kronecker product from the expression.
+    """
+
+    if not isinstance(node.op.core_op, SolveBase):
+        return
+
+    solve_op = node.op
+    props_dict = solve_op.core_op._props_dict()
+
+    if props_dict["b_ndim"] != 1:
+        # The formula used in the rewrite requires that b is a vector, otherwise it's not clear how to reshape it
+        # to conform with the components of the kronecker product.
+        return
+
+    A, b = node.inputs
+
+    if not A.owner or not (
+        isinstance(A.owner.op, KroneckerProduct)
+        or isinstance(A.owner.op, Blockwise)
+        and isinstance(A.owner.op.core_op, KroneckerProduct)
+    ):
+        return
+
+    x1, x2 = A.owner.inputs
+
+    m, n = x1.shape[-2], x2.shape[-2]
+    batch_shapes = x1.shape[:-2]
+    B = b.reshape((*batch_shapes, m, n))
+
+    props_dict["b_ndim"] = 2
+    new_solve_op = Blockwise(type(solve_op.core_op)(**props_dict))
+
+    return [new_solve_op(x1, new_solve_op(x2, B.mT).mT).reshape((*batch_shapes, -1))]
 
 
 @register_canonicalize

@@ -828,6 +828,93 @@ def test_slogdet_kronecker_rewrite():
     )
 
 
+@pytest.mark.parametrize(
+    "a_shape, b_shape",
+    [((5, 5), (5, 5)), ((5, 5), (3, 3)), ((3, 4, 4), (3, 3, 3))],
+    ids=["same", "diff", "batch_diff"],
+)
+@pytest.mark.parametrize(
+    "solve_op, solve_kwargs",
+    [
+        (pt.linalg.solve, {"assume_a": "gen"}),
+        (pt.linalg.solve, {"assume_a": "pos"}),
+        (pt.linalg.solve, {"assume_a": "upper triangular"}),
+    ],
+    ids=["general", "positive definite", "triangular"],
+)
+def test_rewrite_solve_kron_to_solve(a_shape, b_shape, solve_op, solve_kwargs):
+    A, B = pt.tensor("A", shape=a_shape), pt.tensor("B", shape=b_shape)
+
+    m, n = a_shape[-2], b_shape[-2]
+    has_batch = len(a_shape) == 3
+    y_shape = (a_shape[0], m * n) if has_batch else (m * n,)
+    y = pt.tensor("y", shape=y_shape)
+    C = pt.vectorize(pt.linalg.kron, "(i,j),(k,l)->(m,n)")(A, B)
+
+    x = solve_op(C, y, **solve_kwargs, b_ndim=1)
+    fn_expected = pytensor.function(
+        [A, B, y], x, mode=get_default_mode().excluding("rewrite_solve_kron_to_solve")
+    )
+    assert (
+        sum(
+            [
+                isinstance(node.op, KroneckerProduct)
+                or (
+                    isinstance(node.op, Blockwise)
+                    and isinstance(node.op.core_op, KroneckerProduct)
+                )
+                for node in fn_expected.maker.fgraph.apply_nodes
+            ]
+        )
+        == 1
+    )
+
+    fn = pytensor.function([A, B, y], x)
+    assert (
+        sum(
+            [
+                isinstance(node.op, KroneckerProduct)
+                or (
+                    isinstance(node.op, Blockwise)
+                    and isinstance(node.op.core_op, KroneckerProduct)
+                )
+                for node in fn.maker.fgraph.apply_nodes
+            ]
+        )
+        == 0
+    )
+
+    rng = np.random.default_rng(sum(map(ord, "Go away Kron!")))
+    a_val = rng.normal(size=a_shape).astype(config.floatX)
+    b_val = rng.normal(size=b_shape).astype(config.floatX)
+    y_val = rng.normal(size=y_shape).astype(config.floatX)
+
+    if solve_kwargs["assume_a"] == "pos":
+        a_val = a_val @ a_val.mT
+        b_val = b_val @ b_val.mT
+    elif solve_kwargs["assume_a"] == "upper triangular":
+        a_idx = np.tril_indices(n=a_shape[-2], m=a_shape[-1], k=-1)
+        b_idx = np.tril_indices(n=b_shape[-2], m=b_shape[-1], k=-1)
+
+        if len(a_shape) > 2:
+            a_idx = (slice(None, None), *a_idx)
+        if len(b_shape) > 2:
+            b_idx = (slice(None, None), *b_idx)
+
+        a_val[a_idx] = 0
+        b_val[b_idx] = 0
+
+    expected = fn_expected(a_val, b_val, y_val)
+    result = fn(a_val, b_val, y_val)
+
+    np.testing.assert_allclose(
+        expected,
+        result,
+        atol=1e-8 if config.floatX == "float64" else 1e-5,
+        rtol=1e-8 if config.floatX == "float64" else 1e-5,
+    )
+
+
 def test_cholesky_eye_rewrite():
     x = pt.eye(10)
     L = pt.linalg.cholesky(x)
