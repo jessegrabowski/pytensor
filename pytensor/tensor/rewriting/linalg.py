@@ -864,14 +864,14 @@ def rewrite_solve_kron_to_solve(fgraph, node):
     """
     Given a linear system of the form:
 
-    .. math:
+    .. math::
 
         (A \\otimes B) x = y
 
-    Define :math:`\text{vec}(x)` as a column-wise raveling operation (``x.reshape(-1, order='F")`` in code). Further,
+    Define :math:`\text{vec}(x)` as a column-wise raveling operation (``x.reshape(-1, order='F')`` in code). Further,
      define :math:`y = \text{vec}(Y)`. Then the above expression can be rewritten as:
 
-    ..math::
+    .. math::
 
         x = \text{vec}(B^{-1} Y A^{-T})
 
