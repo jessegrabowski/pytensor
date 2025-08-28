@@ -543,3 +543,93 @@ class _LAPACK:
             _ptr_int,  # INFO
         )
         return functype(lapack_ptr)
+
+    @classmethod
+    def numba_rgees(cls, dtype):
+        """
+        Compute the eigenvalues of a real M-by-N matrix A, along with its eigenvectors. Computes matrices Z and T
+        such that A = Z @ T @ Z.T
+
+        The real and imaginary cases are handled separately because the function signatures are not the same.
+        """
+        lapack_ptr, float_pointer = _get_lapack_ptr_and_ptr_type(dtype, "gees")
+
+        functype = ctypes.CFUNCTYPE(
+            None,
+            _ptr_int,  # JOBVS
+            _ptr_int,  # SORT
+            _ptr_int,  # SELECT
+            _ptr_int,  # N
+            float_pointer,  # A
+            _ptr_int,  # LDA
+            _ptr_int,  # SDIM
+            float_pointer,  # WR
+            float_pointer,  # WI
+            float_pointer,  # VS
+            _ptr_int,  # LDVS
+            float_pointer,  # WORK
+            _ptr_int,  # LWORK
+            _ptr_int,  # BWORK
+            _ptr_int,  # INFO
+        )
+
+        return functype(lapack_ptr)
+
+    @classmethod
+    def numba_cgees(cls, dtype):
+        """
+        Compute the eigenvalues of a complex M-by-N matrix A, along with its eigenvectors. Computes matrices Z and T
+        such that A = Z @ T @ Z.conj.T
+
+        The real and imaginary cases are handled separately because the function signatures are not the same.
+        """
+
+        lapack_ptr, float_pointer = _get_lapack_ptr_and_ptr_type(dtype, "gees")
+        functype = ctypes.CFUNCTYPE(
+            None,
+            _ptr_int,  # JOBVS
+            _ptr_int,  # SORT
+            _ptr_int,  # SELECT
+            _ptr_int,  # N
+            float_pointer,  # A
+            _ptr_int,  # LDA
+            _ptr_int,  # SDIM
+            float_pointer,  # W
+            float_pointer,  # VS
+            _ptr_int,  # LDVS
+            float_pointer,  # WORK
+            _ptr_int,  # LWORK
+            float_pointer,  # RWORK
+            _ptr_int,  # BWORK
+            _ptr_int,  # INFO
+        )
+
+        return functype(lapack_ptr)
+
+    @classmethod
+    def numba_xtrsyl(cls, dtype):
+        """
+        Solve the Sylvester equation A @ X + X @ B = C for X.
+
+        A and B should be quasi-triangular in Schur canonical form, as returned by xHSEQR
+        """
+        lapack_ptr, float_pointer = _get_lapack_ptr_and_ptr_type(dtype, "trsyl")
+
+        functype = ctypes.CFUNCTYPE(
+            None,
+            _ptr_int,  # TRANA
+            _ptr_int,  # TRANB
+            _ptr_int,  # ISGN
+            _ptr_int,  # M
+            _ptr_int,  # N
+            float_pointer,  # A
+            _ptr_int,  # LDA
+            float_pointer,  # B
+            _ptr_int,  # LDB
+            float_pointer,  # C
+            _ptr_int,  # LDC
+            float_pointer,  # SCALE
+            _ptr_int,  # INFO
+        )
+
+        return functype(lapack_ptr)
