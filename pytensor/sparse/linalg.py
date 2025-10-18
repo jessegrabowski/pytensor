@@ -67,7 +67,7 @@ def block_diag(*matrices: TensorVariable, format: Literal["csc", "csr"] = "csc")
 
     .. testcode::
         import numpy as np
-        from pytensor.sparse import block_diag
+        from pytensor.sparse.linalg import block_diag
         from scipy.sparse import csr_matrix
 
         A = csr_matrix([[1, 2], [3, 4]])
