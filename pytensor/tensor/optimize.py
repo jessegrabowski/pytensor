@@ -7,21 +7,23 @@ import numpy as np
 import pytensor.scalar as ps
 from pytensor.compile.function import function
 from pytensor.gradient import grad, grad_not_implemented, jacobian
+from pytensor.graph import rewrite_graph
 from pytensor.graph.basic import Apply, Constant
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import ComputeMapType, HasInnerGraph, Op, StorageMapType
 from pytensor.graph.replace import graph_replace
 from pytensor.graph.traversal import ancestors, truncated_graph_inputs
 from pytensor.scalar import ScalarType, ScalarVariable
+from pytensor.tensor import as_tensor_variable
 from pytensor.tensor.basic import (
     atleast_2d,
-    concatenate,
     scalar_from_tensor,
     tensor,
     tensor_from_scalar,
     zeros_like,
 )
-from pytensor.tensor.math import dot
+from pytensor.tensor.math import dot, tensordot
+from pytensor.tensor.reshape import pack, unpack
 from pytensor.tensor.slinalg import solve
 from pytensor.tensor.type import DenseTensorType
 from pytensor.tensor.variable import TensorVariable, Variable
@@ -295,12 +297,14 @@ def scalar_implict_optimization_grads(
 
 
 def implict_optimization_grads(
-    df_dx: TensorVariable,
-    df_dtheta_columns: Sequence[TensorVariable],
+    implicit_f: TensorVariable,
+    inner_x: TensorVariable,
     args: Sequence[TensorVariable | ScalarVariable],
+    inner_args: Sequence[TensorVariable | ScalarVariable],
     x_star: TensorVariable,
     output_grad: TensorVariable,
     fgraph: FunctionGraph,
+    use_vectorized_jac: bool,
 ) -> list[TensorVariable | ScalarVariable]:
     r"""
     Compute gradients of an optimization problem with respect to its parameters.
@@ -321,7 +325,8 @@ def implict_optimization_grads(
 
     .. math::
 
-        \frac{d x^*(\theta)}{d \theta} = - \left(\frac{\partial f}{\partial x}\left(x^*(\theta), \theta\right)\right)^{-1} \frac{\partial f}{\partial \theta}\left(x^*(\theta), \theta\right)
+        \frac{d x^*(\theta)}{d \theta} = - \left(\frac{\partial f}{\partial x}\left(x^*(\theta),
+        \theta\right)\right)^{-1} \frac{\partial f}{\partial \theta}\left(x^*(\theta), \theta\right)
 
     Note that this method assumes `f(x_star(theta), theta) = 0`; so it is not immediately applicable to a minimization
     problem, where `f` is the objective function. In this case, we instead take `f` to be the gradient of the objective
@@ -343,10 +348,28 @@ def implict_optimization_grads(
     fgraph : FunctionGraph
         The function graph that contains the inputs and outputs of the optimization problem.
     """
-    df_dtheta = concatenate(
-        [atleast_2d(jac_col, left=False) for jac_col in df_dtheta_columns],
-        axis=-1,
+    packed_inner_args, packed_arg_shapes, implicit_f = (
+        _maybe_pack_input_variables_and_rewrite_objective(
+            implicit_f,
+            inner_args,
+        )
     )
+
+    df_dx, df_dtheta = jacobian(
+        implicit_f,
+        [inner_x, packed_inner_args],
+        disconnected_inputs="ignore",
+        vectorize=use_vectorized_jac,
+    )
+
+    # if not use_vectorized_jac:
+    #     # Scan can destroy shape information that we might have, so we need to re-introduce it here
+    #     f_shape = implicit_f.type.shape[0] if implicit_f.ndim > 0 else None
+    #     inner_x_shape = inner_x.type.shape[0] if inner_x.ndim > 0 else None
+    #     theta_shape = packed_inner_args.type.shape[0] if packed_inner_args.ndim > 0 else None
+    #
+    #     df_dx = specify_shape(df_dx, tuple(s for s in (f_shape, inner_x_shape) if s is not None))
+    #     df_dtheta = specify_shape(df_dtheta, tuple(s for s in (f_shape, theta_shape) if s is not None))
 
     replace = dict(zip(fgraph.inputs, (x_star, *args), strict=True))
 
@@ -355,11 +378,24 @@ def implict_optimization_grads(
     )
 
     grad_wrt_args_vector = solve(-df_dx_star, df_dtheta_star)
-    grad_wrt_args = _get_parameter_grads_from_vector(
-        grad_wrt_args_vector, x_star, args, output_grad
+    grad_wrt_args = unpack(
+        packed_input=grad_wrt_args_vector,
+        axes=0,  # TODO: Is this always zero?
+        packed_shapes=packed_arg_shapes,
     )
 
-    return grad_wrt_args
+    # Rewrite to remove dependency on the original inputs (not their packed form). In general, these show up in
+    # the final graph only to define static shapes.
+    grad_wrt_args = rewrite_graph(grad_wrt_args, include=("ShapeOpt", "canonicalize"))
+
+    final_grads = []
+    for arg in grad_wrt_args:
+        grad_wrt_arg = tensordot(output_grad, arg, [[0], [0]])
+        if isinstance(arg.type, ScalarType):
+            grad_wrt_arg = scalar_from_tensor(grad_wrt_arg)
+        final_grads.append(grad_wrt_arg)
+
+    return final_grads
 
 
 class MinimizeScalarOp(ScipyScalarWrapperOp):
@@ -599,15 +635,10 @@ class MinimizeOp(ScipyVectorWrapperOp):
 
         implicit_f = grad(inner_fx, inner_x)
 
-        df_dx, *df_dtheta_columns = jacobian(
-            implicit_f,
-            [inner_x, *inner_args],
-            disconnected_inputs="ignore",
-            vectorize=self.use_vectorized_jac,
-        )
         grad_wrt_args = implict_optimization_grads(
-            df_dx=df_dx,
-            df_dtheta_columns=df_dtheta_columns,
+            implicit_f=implicit_f,
+            inner_x=inner_x,
+            inner_args=inner_args,
             args=args,
             x_star=x_star,
             output_grad=output_grad,
@@ -617,15 +648,44 @@ class MinimizeOp(ScipyVectorWrapperOp):
         return [zeros_like(x), *grad_wrt_args]
 
 
+def _maybe_pack_input_variables_and_rewrite_objective(
+    objective: TensorVariable,
+    x: TensorVariable | Sequence[TensorVariable],
+) -> tuple[TensorVariable, list[TensorVariable] | None, TensorVariable]:
+    packed_shapes = None
+
+    if not isinstance(x, Sequence):
+        packed_input = x
+
+    else:
+        packed_input, packed_shapes = pack(*x, axes=None)
+        unpacked_output = unpack(packed_input, axes=None, packed_shapes=packed_shapes)
+
+        objective = graph_replace(
+            objective,
+            {
+                xi: ui
+                if not (isinstance(xi.type, ScalarType))
+                else scalar_from_tensor(ui)
+                for xi, ui in zip(x, unpacked_output)
+            },
+        )
+
+    return packed_input, packed_shapes, objective
+
+
 def minimize(
     objective: TensorVariable,
-    x: TensorVariable,
+    x: TensorVariable | Sequence[TensorVariable],
     method: str = "BFGS",
     jac: bool = True,
     hess: bool = False,
     use_vectorized_jac: bool = False,
     optimizer_kwargs: dict | None = None,
-) -> tuple[TensorVariable, TensorVariable]:
+) -> (
+    tuple[TensorVariable, TensorVariable]
+    | tuple[tuple[TensorVariable, ...], TensorVariable]
+):
     """
     Minimize a scalar objective function using scipy.optimize.minimize.
 
@@ -633,8 +693,8 @@ def minimize(
     ----------
     objective : TensorVariable
         The objective function to minimize. This should be a pytensor variable representing a scalar value.
-    x: TensorVariable
-        The variable with respect to which the objective function is minimized. It must be an input to the
+    x: TensorVariable or list of TensorVariable
+        The variable or variables with respect to which the objective function is minimized. It must be an input to the
         computational graph of `objective`.
     method: str, optional
         The optimization method to use. Default is "BFGS". See scipy.optimize.minimize for other options.
@@ -653,18 +713,23 @@ def minimize(
 
     Returns
     -------
-    solution: TensorVariable
-        The optimized value of the vector of inputs `x` that minimizes `objective(x, *args)`. If the success flag
+    solution: TensorVariable or tuple of TensorVariable
+        The optimized value of each of inputs `x` that minimizes `objective(x, *args)`. If the success flag
         is False, this will be the final state of the minimization routine, but not necessarily a minimum.
 
     success: TensorVariable
         Symbolic boolean flag indicating whether the minimization routine reported convergence to a minimum
         value, based on the requested convergence criteria.
     """
-    args = _find_optimization_parameters(objective, x)
+    objective = as_tensor_variable(objective)
+
+    packed_input, packed_shapes, objective = (
+        _maybe_pack_input_variables_and_rewrite_objective(objective, x)
+    )
+    args = _find_optimization_parameters(objective, packed_input)
 
     minimize_op = MinimizeOp(
-        x,
+        packed_input,
         *args,
         objective=objective,
         method=method,
@@ -674,7 +739,11 @@ def minimize(
         optimizer_kwargs=optimizer_kwargs,
     )
 
-    solution, success = minimize_op(x, *args)
+    solution, success = minimize_op(packed_input, *args)
+
+    if packed_shapes is not None:
+        solution = unpack(solution, axes=None, packed_shapes=packed_shapes)
+        solution = rewrite_graph(solution, include=("ShapeOpt", "canonicalize"))
 
     return solution, success
 
@@ -784,6 +853,7 @@ class RootScalarOp(ScipyScalarWrapperOp):
             x_star=x_star,
             output_grad=output_grad,
             fgraph=self.fgraph,
+            use_vectorized_jac=self.use_vectorized_jac,
         )
 
         return [zeros_like(x), *grad_wrt_args]
@@ -967,25 +1037,15 @@ class RootOp(ScipyVectorWrapperOp):
         inner_x, *inner_args = self.fgraph.inputs
         inner_fx = self.fgraph.outputs[0]
 
-        df_dx = (
-            jacobian(inner_fx, inner_x, vectorize=self.use_vectorized_jac)
-            if not self.jac
-            else self.fgraph.outputs[1]
-        )
-        df_dtheta_columns = jacobian(
-            inner_fx,
-            inner_args,
-            disconnected_inputs="ignore",
-            vectorize=self.use_vectorized_jac,
-        )
-
         grad_wrt_args = implict_optimization_grads(
-            df_dx=df_dx,
-            df_dtheta_columns=df_dtheta_columns,
+            implicit_f=inner_fx,
+            inner_x=inner_x,
+            inner_args=inner_args,
             args=args,
             x_star=x_star,
             output_grad=output_grad,
             fgraph=self.fgraph,
+            use_vectorized_jac=self.use_vectorized_jac,
         )
 
         return [zeros_like(x), *grad_wrt_args]
@@ -1032,11 +1092,13 @@ def root(
     success: TensorVariable
         Boolean indicating whether the root-finding was successful. If True, the solution is a root of the equation
     """
-
-    args = _find_optimization_parameters(equations, variables)
+    packed_variables, packed_shapes, equations = (
+        _maybe_pack_input_variables_and_rewrite_objective(equations, variables)
+    )
+    args = _find_optimization_parameters(equations, packed_variables)
 
     root_op = RootOp(
-        variables,
+        packed_variables,
         *args,
         equations=equations,
         method=method,
@@ -1045,7 +1107,10 @@ def root(
         use_vectorized_jac=use_vectorized_jac,
     )
 
-    solution, success = root_op(variables, *args)
+    solution, success = root_op(packed_variables, *args)
+    if packed_shapes is not None:
+        solution = unpack(solution, axes=None, packed_shapes=packed_shapes)
+        rewrite_graph(solution, include=("ShapeOpt", "canonicalize", "specialize"))
 
     return solution, success
 

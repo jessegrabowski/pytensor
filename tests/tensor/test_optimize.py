@@ -96,7 +96,13 @@ def test_minimize_vector_x(method, jac, hess):
 
     objective = rosenbrock_shifted_scaled(x, a, b)
     minimized_x, success = minimize(
-        objective, x, method=method, jac=jac, hess=hess, optimizer_kwargs={"tol": 1e-16}
+        objective,
+        x,
+        method=method,
+        jac=jac,
+        hess=hess,
+        optimizer_kwargs={"tol": 1e-16},
+        use_vectorized_jac=True,
     )
 
     fn = pytensor.function([x, a, b], [minimized_x, success])
@@ -119,10 +125,83 @@ def test_minimize_vector_x(method, jac, hess):
 
     def f(x, a, b):
         objective = rosenbrock_shifted_scaled(x, a, b)
-        out = minimize(objective, x)[0]
+        out = minimize(objective, x, use_vectorized_jac=False)[0]
         return out
 
     utt.verify_grad(f, [x0, a_val, b_val], eps=1e-3 if floatX == "float32" else 1e-6)
+
+
+def test_optimize_multuple_minimands():
+    """
+    Test optimization with many input variables of different shapes, as occurs in a PyMC model.
+    """
+    x0, x1, x2 = pt.dvectors("x1", "x2", "d3")
+    x3 = pt.dmatrix("x3")
+    b0, b1, b2 = pt.dscalars("b0", "b1", "b2")
+    b3 = pt.dvector("b3")
+
+    y = pt.dvector("y")
+
+    y_hat = x0 * b0 + x1 * b1 + x2 * b2 + x3 @ b3
+    objective = ((y - y_hat) ** 2).sum()
+
+    minimized_x, success = minimize(
+        objective,
+        [b0, b1, b2, b3],
+        jac=True,
+        hess=True,
+        method="Newton-CG",
+        use_vectorized_jac=True,
+    )
+
+    assert len(minimized_x) == 4
+
+    fn = pytensor.function([b0, b1, b2, b3, x0, x1, x2, x3, y], [*minimized_x, success])
+
+    rng = np.random.default_rng()
+    X = rng.normal(size=(100, 3)).astype(floatX)
+    X3 = rng.normal(size=(100, 5)).astype(floatX)
+    b_vec = rng.normal(size=(8,)).astype(floatX)
+    true_b = [b_vec[0], b_vec[1], b_vec[2], b_vec[3:]]
+    true_y = X @ b_vec[0:3] + X3 @ b_vec[3:]
+    init_b = np.zeros((8,)).astype(floatX)
+
+    inputs = (
+        init_b[0],
+        init_b[1],
+        init_b[2],
+        init_b[3:],
+        X[:, 0],
+        X[:, 1],
+        X[:, 2],
+        X3,
+        true_y,
+    )
+
+    *estimated_b, success = fn(*inputs)
+    assert success
+    for est, true in zip(estimated_b, true_b):
+        np.testing.assert_allclose(
+            est,
+            true,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    def f(b0, b1, b2, b3, x0, x1, x2, x3, y):
+        y_hat = x0 * b0 + x1 * b1 + x2 * b2 + x3 @ b3
+        objective = ((y - y_hat) ** 2).sum()
+        result = minimize(
+            objective,
+            [b0, b1, b2, b3],
+            jac=True,
+            hess=True,
+            method="Newton-CG",
+            use_vectorized_jac=True,
+        )[0]
+        return pt.sum([x.sum() for x in result])
+
+    utt.verify_grad(f, inputs, eps=1e-3 if floatX == "float32" else 1e-6)
 
 
 @pytest.mark.parametrize(
