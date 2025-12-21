@@ -6,6 +6,7 @@ import numpy as np
 from numpy.lib._array_utils_impl import normalize_axis_tuple
 
 from pytensor import Variable
+from pytensor.gradient import DisconnectedType
 from pytensor.graph import Apply
 from pytensor.graph.op import Op
 from pytensor.graph.replace import _vectorize_node
@@ -79,6 +80,17 @@ class JoinDims(Op):
         )
 
         out[0] = x.reshape(output_shape)
+
+    def L_op(
+        self,
+        inputs: Sequence[Variable],
+        outputs: Sequence[Variable],
+        output_grads: Sequence[Variable],
+    ) -> list[Variable]:
+        (x,) = inputs
+        (g_out,) = output_grads
+
+        return [g_out.reshape(x.shape)]
 
 
 @_vectorize_node.register(JoinDims)
@@ -190,6 +202,19 @@ class SplitDims(Op):
         output_shape = (*x.shape[: self.axis], *shape, *x.shape[self.axis + 1 :])
 
         out[0] = x.reshape(output_shape)
+
+    def L_op(
+        self,
+        inputs: Sequence[Variable],
+        outputs: Sequence[Variable],
+        output_grads: Sequence[Variable],
+    ) -> list[Variable]:
+        (x, _) = inputs
+        (g_out,) = output_grads
+
+        output_shape = (*x.shape[: self.axis], -1, *x.shape[self.axis + 1 :])
+
+        return [g_out.reshape(output_shape), DisconnectedType()()]
 
 
 @_vectorize_node.register(SplitDims)
