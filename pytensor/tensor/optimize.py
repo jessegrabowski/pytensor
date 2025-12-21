@@ -378,19 +378,28 @@ def implict_optimization_grads(
     )
 
     grad_wrt_args_vector = solve(-df_dx_star, df_dtheta_star)
-    grad_wrt_args = unpack(
-        packed_input=grad_wrt_args_vector,
-        axes=0,  # TODO: Is this always zero?
-        packed_shapes=packed_arg_shapes,
-    )
+
+    if len(packed_arg_shapes) == 1:
+        grad_wrt_args = grad_wrt_args_vector
+    else:
+        grad_wrt_args = unpack(
+            packed_input=grad_wrt_args_vector,
+            axes=0,
+            packed_shapes=packed_arg_shapes,
+        )
 
     # Rewrite to remove dependency on the original inputs (not their packed form). In general, these show up in
     # the final graph only to define static shapes.
-    grad_wrt_args = rewrite_graph(grad_wrt_args, include=("ShapeOpt", "canonicalize"))
+    grad_wrt_args = rewrite_graph(
+        grad_wrt_args, include=("ShapeOpt", "canonicalize", "stabilize")
+    )
 
     final_grads = []
     for arg in grad_wrt_args:
-        grad_wrt_arg = tensordot(output_grad, arg, [[0], [0]])
+        if arg.ndim == 0 or output_grad.ndim == 0:
+            grad_wrt_arg = output_grad * arg
+        else:
+            grad_wrt_arg = tensordot(output_grad, arg, [[0], [0]])
         if isinstance(arg.type, ScalarType):
             grad_wrt_arg = scalar_from_tensor(grad_wrt_arg)
         final_grads.append(grad_wrt_arg)
@@ -643,6 +652,7 @@ class MinimizeOp(ScipyVectorWrapperOp):
             x_star=x_star,
             output_grad=output_grad,
             fgraph=self.fgraph,
+            use_vectorized_jac=self.use_vectorized_jac,
         )
 
         return [zeros_like(x), *grad_wrt_args]
@@ -663,14 +673,15 @@ def _maybe_pack_input_variables_and_rewrite_objective(
 
         objective = graph_replace(
             objective,
-            {
-                xi: ui
-                if not (isinstance(xi.type, ScalarType))
-                else scalar_from_tensor(ui)
-                for xi, ui in zip(x, unpacked_output)
-            },
+            dict(zip(x, unpacked_output)),
+            # {
+            #     xi: ui
+            #     if not (isinstance(xi.type, ScalarType))
+            #     else scalar_from_tensor(ui)
+            #     for xi, ui in zip(x, unpacked_output)
+            # }
         )
-
+        # objective = rewrite_graph(objective, include=("ShapeOpt", "canonicalize"))
     return packed_input, packed_shapes, objective
 
 
@@ -743,7 +754,7 @@ def minimize(
 
     if packed_shapes is not None:
         solution = unpack(solution, axes=None, packed_shapes=packed_shapes)
-        solution = rewrite_graph(solution, include=("ShapeOpt", "canonicalize"))
+        # solution = rewrite_graph(solution, include=("ShapeOpt", "canonicalize", "stabilize"))
 
     return solution, success
 
@@ -853,7 +864,6 @@ class RootScalarOp(ScipyScalarWrapperOp):
             x_star=x_star,
             output_grad=output_grad,
             fgraph=self.fgraph,
-            use_vectorized_jac=self.use_vectorized_jac,
         )
 
         return [zeros_like(x), *grad_wrt_args]
@@ -1110,7 +1120,7 @@ def root(
     solution, success = root_op(packed_variables, *args)
     if packed_shapes is not None:
         solution = unpack(solution, axes=None, packed_shapes=packed_shapes)
-        rewrite_graph(solution, include=("ShapeOpt", "canonicalize", "specialize"))
+        # rewrite_graph(solution, include=("ShapeOpt", "canonicalize", "stabilize"))
 
     return solution, success
 
