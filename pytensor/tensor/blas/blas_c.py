@@ -1,7 +1,5 @@
 from pytensor.link.c.op import COp
-from pytensor.link.c.params_type import ParamsType
-from pytensor.scalar import bool as bool_t
-from pytensor.tensor.blas._c_code import GEMV_HELPER
+from pytensor.tensor.blas._c_code import GEMV_HELPER, GER_HELPER
 from pytensor.tensor.blas._codegen import gemv_c_code, ger_c_code
 from pytensor.tensor.blas._core import ldflags
 from pytensor.tensor.blas.blas_headers import (
@@ -26,8 +24,8 @@ class BaseBLAS(COp):
         return ldflags(libs=False, include_dir=True)
 
     def c_support_code(self, **kwargs):
-        # BLAS declarations + the GEMV dispatch helper functions.
-        return blas_header_text() + GEMV_HELPER
+        # BLAS declarations + the GEMV and GER dispatch helper functions.
+        return blas_header_text() + GEMV_HELPER + GER_HELPER
 
 
 # ##### ####### #######
@@ -36,17 +34,17 @@ class BaseBLAS(COp):
 
 
 class CGer(BaseBLAS, Ger):
-    """C implementation of GER (rank-1 update): Z = A + alpha * outer(x, y)."""
+    """C implementation of GER (rank-1 update): Z = A + alpha * outer(x, y).
 
-    params_type = ParamsType(
-        destructive=bool_t,
-    )
+    The codegen lives in ger_c_code; ger_helper.h provides the leaf loops and
+    BLAS dispatch.
+    """
 
     def c_code(self, node, name, inp, out, sub):
         return ger_c_code(node, name, inp, out, sub)
 
     def c_code_cache_version(self):
-        return (11, blas_header_version())
+        return (15, blas_header_version())
 
 
 cger_inplace = CGer(True)

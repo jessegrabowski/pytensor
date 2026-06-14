@@ -454,7 +454,7 @@ class TestBlasStridesC(TestBlasStrides):
 def _emit_c_code(op, inputs):
     node = op.make_node(*inputs)
     names = [f"V_in{i}" for i in range(len(node.inputs))]
-    sub = {"fail": "FAIL;", "params": "PARAMS", "id": "0"}
+    sub = {"fail": "FAIL;", "id": "0"}
     return op.c_code(node, "NODE", names, ["V_out0"], sub)
 
 
@@ -533,15 +533,54 @@ def test_blas_c_code_is_dtype_specialized(name, op_inputs):
             CGemv(inplace=False),
             [dvector(), dscalar(), dmatrix(), dvector(), dscalar()],
         ),
+        lambda: (
+            CGer(destructive=True),
+            CGer(destructive=False),
+            [dmatrix(), dscalar(), dvector(), dvector()],
+        ),
     ],
 )
 def test_blas_c_code_inplace_is_specialized(ops_inputs):
-    # inplace is a static op prop, so each variant emits only its own
-    # output-setup arm, with no runtime params branch.
+    # inplace/destructive is a static op prop, so each variant emits only its
+    # own output-setup arm, with no runtime params branch.
     op_inplace, op_outplace, inputs = ops_inputs()
     code_inplace = _emit_c_code(op_inplace, inputs)
     code_outplace = _emit_c_code(op_outplace, inputs)
     for code in (code_inplace, code_outplace):
         assert "->inplace" not in code
+        assert "->destructive" not in code
         assert "params" not in code
     assert code_inplace != code_outplace
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("size", [7, 400])  # 400x400 crosses the BLAS threshold
+@pytest.mark.parametrize("neg_stride", [False, True])
+def test_cger_destructive_paths(dtype, size, neg_stride):
+    # Exercise the in-place GER paths in compiled C: the small manual loop and
+    # the large (>100k element) BLAS-dispatch branch, with negative strides.
+    skip_if_blas_ldflags_empty()
+    A = matrix("A", dtype=dtype)
+    x = vector("x", dtype=dtype)
+    y = vector("y", dtype=dtype)
+    half = np.asarray(0.5, dtype=dtype)
+    f = pytensor.function(
+        [pytensor.In(A, mutable=True), x, y],
+        A + half * pt.outer(x, y),
+        mode=mode_blas_opt,
+    )
+    assert any(isinstance(node.op, CGer) for node in f.maker.fgraph.apply_nodes)
+
+    rng = np.random.default_rng(0)
+    Aval = rng.standard_normal((size, size)).astype(dtype)
+    xval = rng.standard_normal(size).astype(dtype)
+    yval = rng.standard_normal(size).astype(dtype)
+    if neg_stride:
+        xval, yval = xval[::-1], yval[::-1]
+
+    expected = Aval + half * np.outer(xval, yval)
+    np.testing.assert_allclose(
+        f(Aval.copy(), xval, yval),
+        expected,
+        atol=1e-4 if dtype == "float32" else 1e-9,
+    )
