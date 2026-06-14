@@ -2,7 +2,7 @@ import numpy as np
 
 import pytensor.scalar
 from pytensor.graph.basic import Apply
-from pytensor.graph.utils import InconsistencyError, MethodNotDefined
+from pytensor.graph.utils import InconsistencyError
 from pytensor.link.c.op import COp
 from pytensor.link.c.params_type import ParamsType
 from pytensor.printing import FunctionPrinter, pprint
@@ -210,14 +210,12 @@ class Gemm(GemmRelated):
         ]
 
     def c_code(self, node, name, inp, out, sub):
-        if node.inputs[0].type.dtype.startswith("complex"):
-            raise MethodNotDefined(f"{self.__class__.__name__}.c_code")
         return gemm_c_code(node, name, inp, out, sub)
 
     def c_code_cache_version(self):
         gv = self.build_gemm_version()
         if gv:
-            return (8, *gv)
+            return (9, *gv)
         else:
             return gv
 
@@ -263,8 +261,6 @@ class Dot22(GemmRelated):
         return [[input_shapes[0][0], input_shapes[1][1]]]
 
     def c_code(self, node, name, inp, out, sub):
-        if node.inputs[0].type.dtype.startswith("complex"):
-            raise MethodNotDefined(f"{self.__class__.__name__}.c_code")
         if len(self.c_libraries()) <= 0:
             raise NotImplementedError()
         return dot22_c_code(node, name, inp, out, sub)
@@ -272,7 +268,7 @@ class Dot22(GemmRelated):
     def c_code_cache_version(self):
         gv = self.build_gemm_version()
         if gv:
-            return (2, *gv)
+            return (3, *gv)
         else:
             return gv
 
@@ -330,8 +326,6 @@ class Dot22Scalar(GemmRelated):
         return [[input_shapes[0][0], input_shapes[1][1]]]
 
     def c_code(self, node, name, inp, out, sub):
-        if node.inputs[0].type.dtype.startswith("complex"):
-            raise MethodNotDefined(f"{self.__class__.__name__}.c_code")
         if len(self.c_libraries()) <= 0:
             raise NotImplementedError()
         return dot22scalar_c_code(node, name, inp, out, sub)
@@ -339,7 +333,7 @@ class Dot22Scalar(GemmRelated):
     def c_code_cache_version(self):
         gv = self.build_gemm_version()
         if gv:
-            return (2, *gv)
+            return (3, *gv)
         else:
             return gv
 

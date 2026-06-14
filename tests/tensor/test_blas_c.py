@@ -9,6 +9,7 @@ from pytensor.compile import get_mode
 from pytensor.tensor.basic import AllocEmpty
 from pytensor.tensor.blas import Ger
 from pytensor.tensor.blas.blas_c import CGemv, CGer, must_initialize_y_gemv
+from pytensor.tensor.blas.gemm import _dot22, _dot22scalar, gemm_no_inplace
 from pytensor.tensor.type import (
     dmatrix,
     dscalar,
@@ -443,3 +444,72 @@ class TestSdotNoFlags(TestCGemvNoFlags):
 
 class TestBlasStridesC(TestBlasStrides):
     mode = mode_blas_opt
+
+
+def _emit_c_code(op, inputs):
+    node = op.make_node(*inputs)
+    names = [f"V_in{i}" for i in range(len(node.inputs))]
+    sub = {"fail": "FAIL;", "params": "PARAMS", "id": "0"}
+    return op.c_code(node, "NODE", names, ["V_out0"], sub)
+
+
+@pytest.mark.parametrize(
+    "name,op_inputs",
+    [
+        (
+            "gemm",
+            lambda d: (
+                gemm_no_inplace,
+                [
+                    matrix(dtype=d),
+                    scalar(dtype=d),
+                    matrix(dtype=d),
+                    matrix(dtype=d),
+                    scalar(dtype=d),
+                ],
+            ),
+        ),
+        ("dot22", lambda d: (_dot22, [matrix(dtype=d), matrix(dtype=d)])),
+        (
+            "dot22scalar",
+            lambda d: (
+                _dot22scalar,
+                [matrix(dtype=d), matrix(dtype=d), scalar(dtype=d)],
+            ),
+        ),
+        (
+            "cgemv",
+            lambda d: (
+                CGemv(inplace=False),
+                [
+                    vector(dtype=d),
+                    scalar(dtype=d),
+                    matrix(dtype=d),
+                    vector(dtype=d),
+                    scalar(dtype=d),
+                ],
+            ),
+        ),
+    ],
+)
+def test_blas_c_code_is_dtype_specialized(name, op_inputs):
+    # The C BLAS kernels are specialized on the node's static dtype: a float32
+    # node must emit only the single-precision call, with no runtime type_num
+    # switch and no double-precision symbols (and vice versa).
+    is_gemv = name == "cgemv"
+    single = "sgemv" if is_gemv else "sgemm"
+    double = "dgemv" if is_gemv else "dgemm"
+
+    op, inputs = op_inputs("float32")
+    code = _emit_c_code(op, inputs)
+    assert "type_num" not in code
+    assert "NPY_DOUBLE" not in code
+    assert double not in code
+    assert single in code
+
+    op, inputs = op_inputs("float64")
+    code = _emit_c_code(op, inputs)
+    assert "type_num" not in code
+    assert "NPY_FLOAT" not in code
+    assert single not in code
+    assert double in code

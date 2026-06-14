@@ -4,16 +4,31 @@
 # the Apply ``node`` plus the C variable names and returns a C source string,
 # matching the ``c_code(node, name, inputs, outputs, sub)`` contract.
 #
+# The kernels are SPECIALIZED on the node's static dtype: a node is known at
+# graph-construction time to be float32 or float64, so we emit only that
+# precision's BLAS call instead of a runtime ``switch(type_num)``.
+#
 # !!! CACHE DISCIPLINE !!!
 # The CLinker module cache does NOT hash the generated C text (see
 # ``cmodule_key_`` in pytensor/link/c/basic.py). A node's cache key is built
 # from ``c_code_cache_version_apply`` + ``__props__`` + the input/output type
-# versions. Any change to the emitted C must be reflected by BUMPING the leading
-# version int in the corresponding op's cache version -- otherwise callers
+# versions. dtype and static shape ride the type signature automatically, but
+# ANY change to the emitted C must be reflected by BUMPING the leading version
+# int in the corresponding op's ``c_code_cache_version`` -- otherwise callers
 # silently get stale compiled binaries.
 
 from collections.abc import Sequence
 from enum import Enum, auto
+
+from pytensor.graph.utils import MethodNotDefined
+
+
+# Map a (statically known) float dtype to its C type, BLAS precision prefix,
+# and element size in bytes.
+_DTYPE_TO_C = {
+    "float32": ("float", "s", 4),
+    "float64": ("double", "d", 8),
+}
 
 
 class CODE_TOKEN(Enum):
@@ -43,10 +58,12 @@ def build_source_code(code: Sequence[str | CODE_TOKEN]) -> str:
 # GEMM family (Gemm, Dot22, Dot22Scalar)
 # ##### ####### #######
 
+# Shared, dtype-independent GemmRelated template fragments, substituted with the
+# ``%(name)s`` mechanism against the input/output C variable names.
+
 _DECLARE_NS = """
         int unit = 0;
 
-        int type_num = PyArray_DESCR(%(_x)s)->type_num;
         int type_size = PyArray_ITEMSIZE(%(_x)s); // in bytes
 
         npy_intp* Nx = PyArray_DIMS(%(_x)s);
@@ -78,34 +95,6 @@ _CHECK_XYZ_RANK2 = """
                          "rank(z) != 2. rank(z) is %%d.", PyArray_NDIM(%(_zout)s));
             %(fail)s;
         }
-        """
-
-_CHECK_XYZ_DOUBLE_OR_FLOAT = """
-        if ((PyArray_DESCR(%(_x)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_x)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError, "type(x) is not double or float"); %(fail)s;}
-
-        if ((PyArray_DESCR(%(_y)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_y)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError, "type(y) is not double or float"); %(fail)s;}
-
-        if ((PyArray_DESCR(%(_zout)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_zout)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError, "type(z) is not double or float"); %(fail)s;}
-
-        if ((PyArray_DESCR(%(_x)s)->type_num != PyArray_DESCR(%(_y)s)->type_num)
-            ||(PyArray_DESCR(%(_x)s)->type_num != PyArray_DESCR(%(_zout)s)->type_num))
-        { PyErr_SetString(PyExc_NotImplementedError, "type(x), type(y), type(z) are not all the same"); %(fail)s; }
-        """
-
-_GEMM_CHECK_AB_DOUBLE_OR_FLOAT = """
-        if ((PyArray_DESCR(%(_a)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_a)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError, "type(a) is not double or float"); %(fail)s;}
-
-        if ((PyArray_DESCR(%(_b)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_b)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError, "type(b) is not double or float"); %(fail)s;}
         """
 
 _CHECK_DIMS = """
@@ -201,52 +190,8 @@ _COMPUTE_STRIDES = """
                                       type_size);
         """
 
-_BEGIN_SWITCH_TYPENUM = """
-        switch (type_num)
-        {
-        """
-
-_CASE_FLOAT = """
-            case NPY_FLOAT:
-            {
-        """
-
-_CASE_FLOAT_GEMM = """
-                float* x = (float*)PyArray_DATA(%(_x)s);
-                float* y = (float*)PyArray_DATA(%(_y)s);
-                float* z = (float*)PyArray_DATA(%(_zout)s);
-                int Nz0 = Nz[0], Nz1 = Nz[1], Nx1 = Nx[1];
-                if (pytensor_sgemm_dispatch(unit, x, y, z, a, b,
-                                            Nz0, Nz1, Nx1,
-                                            sx_0, sx_1, sy_0, sy_1, sz_0, sz_1) != 0) {
-                    %(fail)s;
-                }
-        """
-
-_CASE_DOUBLE = """
-            }
-            break;
-            case NPY_DOUBLE:
-            {
-        """
-
-_CASE_DOUBLE_GEMM = """
-                double* x = (double*)PyArray_DATA(%(_x)s);
-                double* y = (double*)PyArray_DATA(%(_y)s);
-                double* z = (double*)PyArray_DATA(%(_zout)s);
-                int Nz0 = Nz[0], Nz1 = Nz[1], Nx1 = Nx[1];
-                if (pytensor_dgemm_dispatch(unit, x, y, z, a, b,
-                                            Nz0, Nz1, Nx1,
-                                            sx_0, sx_1, sy_0, sy_1, sz_0, sz_1) != 0) {
-                    %(fail)s;
-                }
-        """
-
-_END_SWITCH_TYPENUM = """
-            }
-            break;
-        }
-        """
+# Gemm output-setup fragments (in-place broadcasts z onto the destroyed input;
+# out-of-place allocates a fresh z and copies the input in).
 
 _GEMM_SETUP_Z_INPLACE = """
         // Needs broadcasting
@@ -370,28 +315,6 @@ _GEMM_BROADCAST_XY = """
 
     """
 
-_GEMM_CASE_FLOAT_AB_CONSTANTS = """
-        #define REAL float
-        float a = (PyArray_DESCR(%(_a)s)->type_num == NPY_FLOAT)
-        ? (REAL)(((float*)PyArray_DATA(%(_a)s))[0])
-        : (REAL)(((double*)PyArray_DATA(%(_a)s))[0]);
-        float b = (PyArray_DESCR(%(_b)s)->type_num == NPY_FLOAT) ?
-        (REAL)(((float*)PyArray_DATA(%(_b)s))[0])
-        : (REAL)(((double*)PyArray_DATA(%(_b)s))[0]);
-        #undef REAL
-        """
-
-_GEMM_CASE_DOUBLE_AB_CONSTANTS = """
-        #define REAL double
-        double a = (PyArray_DESCR(%(_a)s)->type_num == NPY_FLOAT)
-        ? (REAL)(((float*)PyArray_DATA(%(_a)s))[0])
-        : (REAL)(((double*)PyArray_DATA(%(_a)s))[0]);
-        double b = (PyArray_DESCR(%(_b)s)->type_num == NPY_FLOAT) ?
-        (REAL)(((float*)PyArray_DATA(%(_b)s))[0])
-        : (REAL)(((double*)PyArray_DATA(%(_b)s))[0]);
-        #undef REAL
-        """
-
 _DOT22_SETUP_Z = """
         if ((NULL == %(_zout)s)
             || (PyArray_DIMS(%(_zout)s)[0] != PyArray_DIMS(%(_x)s)[0])
@@ -415,85 +338,62 @@ _DOT22_SETUP_Z = """
 
         """
 
-_DOT22_CASE_FLOAT_AB_CONSTANTS = """
-                float a = 1.0;
-                float b = 0.0;
-        """
 
-_DOT22_CASE_DOUBLE_AB_CONSTANTS = """
-                double a = 1.0;
-                double b = 0.0;
-        """
-
-_DOT22SCALAR_CHECK_AB = """
-        if ((PyArray_DESCR(%(_a)s)->type_num != NPY_DOUBLE)
-            && (PyArray_DESCR(%(_a)s)->type_num != NPY_FLOAT))
-        {PyErr_SetString(PyExc_NotImplementedError,
-                         "type(a) is not double or float"); %(fail)s;}
-
-        """
-
-_DOT22SCALAR_CASE_FLOAT_AB_CONSTANTS = """
-        #define REAL float
-        float a = (PyArray_DESCR(%(_a)s)->type_num == NPY_FLOAT)
-        ? (REAL)(((float*)PyArray_DATA(%(_a)s))[0])
-        : (REAL)(((double*)PyArray_DATA(%(_a)s))[0]);
-        #undef REAL
-        float b = 0.0;
-        """
-
-_DOT22SCALAR_CASE_DOUBLE_AB_CONSTANTS = """
-        #define REAL double
-        double a = (PyArray_DESCR(%(_a)s)->type_num == NPY_FLOAT)
-        ? (REAL)(((float*)PyArray_DATA(%(_a)s))[0])
-        : (REAL)(((double*)PyArray_DATA(%(_a)s))[0]);
-        #undef REAL
-        double b = 0.0;
+def _gemm_compute_block(ctype, prec, ab_constants):
+    """The single-precision GEMM dispatch call, with ``a``/``b`` set by ``ab_constants``."""
+    return f"""
+        {{
+            {ab_constants}
+            {ctype}* x = ({ctype}*)PyArray_DATA(%(_x)s);
+            {ctype}* y = ({ctype}*)PyArray_DATA(%(_y)s);
+            {ctype}* z = ({ctype}*)PyArray_DATA(%(_zout)s);
+            int Nz0 = Nz[0], Nz1 = Nz[1], Nx1 = Nx[1];
+            if (pytensor_{prec}gemm_dispatch(unit, x, y, z, a, b,
+                                        Nz0, Nz1, Nx1,
+                                        sx_0, sx_1, sy_0, sy_1, sz_0, sz_1) != 0) {{
+                %(fail)s;
+            }}
+        }}
         """
 
 
-def _assemble_gemm_call(
-    *, setup_z, check_ab, broadcast_xy, ab_constants_float, ab_constants_double
-):
-    """Concatenate the GEMM template fragments in execution order."""
-    return "".join(
-        (
-            _DECLARE_NS,
-            _CHECK_XYZ_RANK2,
-            setup_z,
-            _CHECK_XYZ_DOUBLE_OR_FLOAT,
-            check_ab,
-            broadcast_xy,
-            _CHECK_DIMS,
-            _CHECK_STRIDES,
-            _ENCODE_STRIDES_IN_UNIT,
-            _COMPUTE_STRIDES,
-            _BEGIN_SWITCH_TYPENUM,
-            _CASE_FLOAT,
-            ab_constants_float,
-            _CASE_FLOAT_GEMM,
-            _CASE_DOUBLE,
-            ab_constants_double,
-            _CASE_DOUBLE_GEMM,
-            _END_SWITCH_TYPENUM,
-        )
-    )
+def _check_blas_dtype(dtype, op_name):
+    """Return ``(ctype, prec, elemsize)`` or fall back to ``perform`` via MethodNotDefined."""
+    try:
+        return _DTYPE_TO_C[dtype]
+    except KeyError:
+        raise MethodNotDefined(f"{op_name}.c_code: unsupported dtype {dtype}")
 
 
 def gemm_c_code(node, name, inputs, outputs, sub):
     """C code for ``Gemm``: ``z <- b * z + a * dot(x, y)`` (in/out-of-place)."""
     _z, _a, _x, _y, _b = inputs
     (_zout,) = outputs
-    setup_z = (
-        f"if(%(params)s->inplace){{{_GEMM_SETUP_Z_INPLACE}}}"
-        f"else{{{_GEMM_SETUP_Z_OUTPLACE}}}"
+    ctype, prec, _ = _check_blas_dtype(node.inputs[0].type.dtype, "Gemm")
+    # a and b share the matrices' dtype (enforced by Gemm.make_node).
+    ab_constants = (
+        f"{ctype} a = (({ctype}*)PyArray_DATA(%(_a)s))[0];\n"
+        f"            {ctype} b = (({ctype}*)PyArray_DATA(%(_b)s))[0];"
     )
-    code = _assemble_gemm_call(
-        setup_z=setup_z,
-        check_ab=_GEMM_CHECK_AB_DOUBLE_OR_FLOAT,
-        broadcast_xy=_GEMM_BROADCAST_XY,
-        ab_constants_float=_GEMM_CASE_FLOAT_AB_CONSTANTS,
-        ab_constants_double=_GEMM_CASE_DOUBLE_AB_CONSTANTS,
+    setup_z = (
+        "if(%(params)s->inplace){"
+        + _GEMM_SETUP_Z_INPLACE
+        + "}else{"
+        + _GEMM_SETUP_Z_OUTPLACE
+        + "}"
+    )
+    code = "".join(
+        (
+            _DECLARE_NS,
+            _CHECK_XYZ_RANK2,
+            setup_z,
+            _GEMM_BROADCAST_XY,
+            _CHECK_DIMS,
+            _CHECK_STRIDES,
+            _ENCODE_STRIDES_IN_UNIT,
+            _COMPUTE_STRIDES,
+            _gemm_compute_block(ctype, prec, ab_constants),
+        )
     )
     return code % dict(_z=_z, _a=_a, _x=_x, _y=_y, _b=_b, _zout=_zout, **sub)
 
@@ -502,12 +402,19 @@ def dot22_c_code(node, name, inputs, outputs, sub):
     """C code for ``Dot22``: ``z <- dot(x, y)`` into a freshly allocated z."""
     _x, _y = inputs
     (_zout,) = outputs
-    code = _assemble_gemm_call(
-        setup_z=_DOT22_SETUP_Z,
-        check_ab="",
-        broadcast_xy="",
-        ab_constants_float=_DOT22_CASE_FLOAT_AB_CONSTANTS,
-        ab_constants_double=_DOT22_CASE_DOUBLE_AB_CONSTANTS,
+    ctype, prec, _ = _check_blas_dtype(node.inputs[0].type.dtype, "Dot22")
+    ab_constants = f"{ctype} a = 1.0;\n            {ctype} b = 0.0;"
+    code = "".join(
+        (
+            _DECLARE_NS,
+            _CHECK_XYZ_RANK2,
+            _DOT22_SETUP_Z,
+            _CHECK_DIMS,
+            _CHECK_STRIDES,
+            _ENCODE_STRIDES_IN_UNIT,
+            _COMPUTE_STRIDES,
+            _gemm_compute_block(ctype, prec, ab_constants),
+        )
     )
     return code % dict(_x=_x, _y=_y, _zout=_zout, **sub)
 
@@ -516,12 +423,23 @@ def dot22scalar_c_code(node, name, inputs, outputs, sub):
     """C code for ``Dot22Scalar``: ``z <- a * dot(x, y)`` into a fresh z."""
     _x, _y, _a = inputs
     (_zout,) = outputs
-    code = _assemble_gemm_call(
-        setup_z=_DOT22_SETUP_Z,
-        check_ab=_DOT22SCALAR_CHECK_AB,
-        broadcast_xy="",
-        ab_constants_float=_DOT22SCALAR_CASE_FLOAT_AB_CONSTANTS,
-        ab_constants_double=_DOT22SCALAR_CASE_DOUBLE_AB_CONSTANTS,
+    ctype, prec, _ = _check_blas_dtype(node.inputs[0].type.dtype, "Dot22Scalar")
+    # a shares the matrices' dtype (enforced by Dot22Scalar.make_node).
+    ab_constants = (
+        f"{ctype} a = (({ctype}*)PyArray_DATA(%(_a)s))[0];\n"
+        f"            {ctype} b = 0.0;"
+    )
+    code = "".join(
+        (
+            _DECLARE_NS,
+            _CHECK_XYZ_RANK2,
+            _DOT22_SETUP_Z,
+            _CHECK_DIMS,
+            _CHECK_STRIDES,
+            _ENCODE_STRIDES_IN_UNIT,
+            _COMPUTE_STRIDES,
+            _gemm_compute_block(ctype, prec, ab_constants),
+        )
     )
     return code % dict(_x=_x, _y=_y, _a=_a, _zout=_zout, **sub)
 
@@ -530,83 +448,64 @@ def dot22scalar_c_code(node, name, inputs, outputs, sub):
 # GEMV
 # ##### ####### #######
 
-
-def gemv_c_code(node, name, inputs, outputs, sub):
-    """C code for ``CGemv``: ``z <- beta * y + alpha * dot(A, x)``.
-
-    ``z = y`` if inplace else ``z = y.copy()``; A is a matrix, x and y vectors.
-    """
-    # Imported lazily to avoid an import cycle (blas_c imports this module).
-    from pytensor.tensor.blas.blas_c import must_initialize_y_gemv
-
-    y, alpha, A, x, beta = inputs
-    (z,) = outputs
-    must_initialize_y = must_initialize_y_gemv()
-    code = """
-
-    int elemsize;
-
-    if (PyArray_DIMS(%(A)s)[0] != PyArray_DIMS(%(y)s)[0])
-    {
-        PyErr_SetString(PyExc_ValueError,
-                        "Shape mismatch: A.shape[0] != y.shape[0]");
-        %(fail)s;
-    }
-    if (PyArray_DIMS(%(A)s)[1] != PyArray_DIMS(%(x)s)[0])
-    {
-        PyErr_SetString(PyExc_ValueError,
-                        "Shape mismatch: A.shape[1] != x.shape[0]");
-        %(fail)s;
-    }
-
-    if ((PyArray_DESCR(%(y)s)->type_num != PyArray_DESCR(%(x)s)->type_num)
-        || (PyArray_DESCR(%(y)s)->type_num != PyArray_DESCR(%(A)s)->type_num))
-    {
-        PyErr_SetString(PyExc_TypeError, "GEMV: dtypes of A, x, y do not match");
-        %(fail)s;
-    }
-    if  (PyArray_DESCR(%(y)s)->type_num == NPY_DOUBLE) { elemsize = 8; }
-    else if (PyArray_DESCR(%(y)s)->type_num == NPY_FLOAT) { elemsize = 4; }
-    else {
-        %(fail)s;
-        PyErr_SetString(PyExc_NotImplementedError, "GEMV: Inputs must be float or double");
-    }
-
-    {
-        dtype_%(beta)s fbeta = ((dtype_%(beta)s*)PyArray_DATA(%(beta)s))[0];
-
-        // copy y if not destructive
-        if (!%(params)s->inplace)
+# GEMV output setup, selected by the static ``inplace`` prop: out-of-place
+# copies y into a fresh z; in-place aliases z onto y.
+_GEMV_SETUP_Z_OUTPLACE = """
+        if ((NULL == %(z)s)
+            || (PyArray_DIMS(%(z)s)[0] != PyArray_DIMS(%(y)s)[0]))
         {
-            if ((NULL == %(z)s)
-                || (PyArray_DIMS(%(z)s)[0] != PyArray_DIMS(%(y)s)[0]))
-            {
-                Py_XDECREF(%(z)s);
-                %(z)s = (PyArrayObject*)PyArray_SimpleNew(1,
-                    PyArray_DIMS(%(y)s), PyArray_TYPE(%(y)s));
-                if(!%(z)s) {
-                    PyErr_SetString(PyExc_MemoryError,
-                                    "failed to alloc gemv output");
-                    %(fail)s
-                }
-            }
-            if (fbeta != 0)
-            {
-                // If fbeta is zero, we avoid doing the copy
-                if (PyArray_CopyInto(%(z)s, %(y)s) != 0) {
-                    %(fail)s
-                }
+            Py_XDECREF(%(z)s);
+            %(z)s = (PyArrayObject*)PyArray_SimpleNew(1,
+                PyArray_DIMS(%(y)s), PyArray_TYPE(%(y)s));
+            if(!%(z)s) {
+                PyErr_SetString(PyExc_MemoryError,
+                                "failed to alloc gemv output");
+                %(fail)s
             }
         }
-        else
+        if (beta != 0)
         {
-            if (%(z)s != %(y)s)
-            {
-                Py_XDECREF(%(z)s);
-                %(z)s = %(y)s;
-                Py_INCREF(%(z)s);
+            // If beta is zero, we avoid doing the copy
+            if (PyArray_CopyInto(%(z)s, %(y)s) != 0) {
+                %(fail)s
             }
         }
+"""
+
+_GEMV_SETUP_Z_INPLACE = """
+        if (%(z)s != %(y)s)
+        {
+            Py_XDECREF(%(z)s);
+            %(z)s = %(y)s;
+            Py_INCREF(%(z)s);
+        }
+"""
+
+# Single-precision GEMV body. ``%(ctype)s``/``%(prec)s``/``%(elemsize)s`` are
+# fixed from the node's (statically known) dtype. ``alpha``/``beta`` keep their
+# own stored dtype (Gemv.make_node does not constrain them to match A/x/y).
+# ``__SETUP_Z__`` is spliced in (not %-substituted) before the single % pass.
+_GEMV_CODE = """
+
+    {
+        int elemsize = %(elemsize)s;
+        %(ctype)s beta = ((dtype_%(beta)s*)PyArray_DATA(%(beta)s))[0];
+
+        if (PyArray_DIMS(%(A)s)[0] != PyArray_DIMS(%(y)s)[0])
+        {
+            PyErr_SetString(PyExc_ValueError,
+                            "Shape mismatch: A.shape[0] != y.shape[0]");
+            %(fail)s;
+        }
+        if (PyArray_DIMS(%(A)s)[1] != PyArray_DIMS(%(x)s)[0])
+        {
+            PyErr_SetString(PyExc_ValueError,
+                            "Shape mismatch: A.shape[1] != x.shape[0]");
+            %(fail)s;
+        }
+
+        // set up z (copy y into a fresh output, or alias y in place)
+__SETUP_Z__
 
         {
             int NA0 = PyArray_DIMS(%(A)s)[0];
@@ -616,7 +515,7 @@ def gemv_c_code(node, name, inputs, outputs, sub):
             {
                 // Non-empty A matrix
 
-                if (%(must_initialize_y)d && fbeta == 0)
+                if (%(must_initialize_y)d && beta == 0)
                 {
                     // Most BLAS implementations of GEMV ignore y=nan when beta=0
                     // PyTensor considers that the correct behavior,
@@ -636,9 +535,9 @@ def gemv_c_code(node, name, inputs, outputs, sub):
                 int Sz = PyArray_STRIDES(%(z)s)[0] / elemsize;
                 int Sx = PyArray_STRIDES(%(x)s)[0] / elemsize;
 
-                dtype_%(A)s* A_data = (dtype_%(A)s*) PyArray_DATA(%(A)s);
-                dtype_%(x)s* x_data = (dtype_%(x)s*) PyArray_DATA(%(x)s);
-                dtype_%(z)s* z_data = (dtype_%(z)s*) PyArray_DATA(%(z)s);
+                %(ctype)s* A_data = (%(ctype)s*) PyArray_DATA(%(A)s);
+                %(ctype)s* x_data = (%(ctype)s*) PyArray_DATA(%(x)s);
+                %(ctype)s* z_data = (%(ctype)s*) PyArray_DATA(%(z)s);
 
                 // gemv expects pointers to the beginning of memory arrays,
                 // but numpy provides a pointer to the first element,
@@ -674,47 +573,25 @@ def gemv_c_code(node, name, inputs, outputs, sub):
                     %(A)s = A_copy;
                     SA0 = (NA0 > 1) ? (PyArray_STRIDES(%(A)s)[0] / elemsize) : NA1;
                     SA1 = (NA1 > 1) ? (PyArray_STRIDES(%(A)s)[1] / elemsize) : NA0;
-                    A_data = (dtype_%(A)s*) PyArray_DATA(%(A)s);
+                    A_data = (%(ctype)s*) PyArray_DATA(%(A)s);
                 }
 
                 if (NA0 == 1)
                 {
                     // Vector-vector dot product, it seems faster to avoid GEMV
-                    dtype_%(alpha)s alpha = ((dtype_%(alpha)s*)PyArray_DATA(%(alpha)s))[0];
-
-                    if (elemsize == 4)
-                    {
-                        pytensor_sgemv_dot_case(NA1, SA1,
-                            (float*)A_data, (float*)x_data, (float*)z_data,
-                            alpha, fbeta, Sx);
-                    }
-                    else
-                    {
-                        pytensor_dgemv_dot_case(NA1, SA1,
-                            (double*)A_data, (double*)x_data, (double*)z_data,
-                            alpha, fbeta, Sx);
-                    }
+                    %(ctype)s alpha = ((dtype_%(alpha)s*)PyArray_DATA(%(alpha)s))[0];
+                    pytensor_%(prec)sgemv_dot_case(NA1, SA1,
+                        A_data, x_data, z_data,
+                        alpha, beta, Sx);
                 }
                 else if (SA0 == 1 || SA1 == 1)
                 {
                     // C-contiguous or F-contiguous, use GEMV dispatch helper
-                    if (elemsize == 4)
-                    {
-                        float alpha = ((dtype_%(alpha)s*)PyArray_DATA(%(alpha)s))[0];
-                        if (pytensor_sgemv_dispatch(NA0, NA1, SA0, SA1,
-                                (float*)A_data, (float*)x_data, (float*)z_data,
-                                alpha, fbeta, Sx, Sz) != 0) {
-                            %(fail)s
-                        }
-                    }
-                    else
-                    {
-                        double alpha = ((dtype_%(alpha)s*)PyArray_DATA(%(alpha)s))[0];
-                        if (pytensor_dgemv_dispatch(NA0, NA1, SA0, SA1,
-                                (double*)A_data, (double*)x_data, (double*)z_data,
-                                alpha, fbeta, Sx, Sz) != 0) {
-                            %(fail)s
-                        }
+                    %(ctype)s alpha = ((dtype_%(alpha)s*)PyArray_DATA(%(alpha)s))[0];
+                    if (pytensor_%(prec)sgemv_dispatch(NA0, NA1, SA0, SA1,
+                            A_data, x_data, z_data,
+                            alpha, beta, Sx, Sz) != 0) {
+                        %(fail)s
                     }
                 }
                 else
@@ -726,19 +603,40 @@ def gemv_c_code(node, name, inputs, outputs, sub):
             } else
             {
                 // Empty A matrix, just scale y by beta
-                if (fbeta != 1.0)
+                if (beta != 1.0)
                 {
                     npy_intp Sz = PyArray_STRIDES(%(z)s)[0] / elemsize;
-                    dtype_%(z)s* z_data = (dtype_%(z)s*) PyArray_DATA(%(z)s);
+                    %(ctype)s* z_data = (%(ctype)s*) PyArray_DATA(%(z)s);
                     for (npy_intp i = 0; i < NA0; ++i)
                     {
-                        z_data[i * Sz] = (fbeta == 0.0) ? 0 : z_data[i * Sz] * fbeta;
+                        z_data[i * Sz] = (beta == 0.0) ? 0 : z_data[i * Sz] * beta;
                     }
                 }
             }
         }
     }
     """
+
+
+def gemv_c_code(node, name, inputs, outputs, sub):
+    """C code for ``CGemv``: ``z <- beta * y + alpha * dot(A, x)``.
+
+    ``z = y`` if inplace else ``z = y.copy()``; A is a matrix, x and y vectors.
+    """
+    # Imported lazily to avoid an import cycle (blas_c imports this module).
+    from pytensor.tensor.blas.blas_c import must_initialize_y_gemv
+
+    y, alpha, A, x, beta = inputs
+    (z,) = outputs
+    ctype, prec, elemsize = _check_blas_dtype(node.inputs[0].type.dtype, "CGemv")
+    setup_z = (
+        "if (!%(params)s->inplace) {"
+        + _GEMV_SETUP_Z_OUTPLACE
+        + "} else {"
+        + _GEMV_SETUP_Z_INPLACE
+        + "}"
+    )
+    code = _GEMV_CODE.replace("__SETUP_Z__", setup_z)
     return code % dict(
         y=y,
         A=A,
@@ -746,7 +644,10 @@ def gemv_c_code(node, name, inputs, outputs, sub):
         z=z,
         alpha=alpha,
         beta=beta,
-        must_initialize_y=must_initialize_y,
+        ctype=ctype,
+        prec=prec,
+        elemsize=elemsize,
+        must_initialize_y=must_initialize_y_gemv(),
         **sub,
     )
 
