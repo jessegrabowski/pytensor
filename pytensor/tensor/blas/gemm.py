@@ -4,9 +4,7 @@ import pytensor.scalar
 from pytensor.graph.basic import Apply
 from pytensor.graph.utils import InconsistencyError
 from pytensor.link.c.op import COp
-from pytensor.link.c.params_type import ParamsType
 from pytensor.printing import FunctionPrinter, pprint
-from pytensor.scalar import bool as bool_t
 from pytensor.tensor.basic import as_tensor_variable
 from pytensor.tensor.blas._c_code import GEMM_HELPER
 from pytensor.tensor.blas._codegen import (
@@ -90,9 +88,6 @@ class Gemm(GemmRelated):
     E_float = "gemm requires floating-point dtypes"
 
     __props__ = ("inplace",)
-    params_type = ParamsType(
-        inplace=bool_t,
-    )
     check_input = False
 
     def __init__(self, inplace):
@@ -215,7 +210,7 @@ class Gemm(GemmRelated):
     def c_code_cache_version(self):
         gv = self.build_gemm_version()
         if gv:
-            return (9, *gv)
+            return (10, *gv)
         else:
             return gv
 

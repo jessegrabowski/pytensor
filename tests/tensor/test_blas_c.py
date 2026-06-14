@@ -9,7 +9,12 @@ from pytensor.compile import get_mode
 from pytensor.tensor.basic import AllocEmpty
 from pytensor.tensor.blas import Ger
 from pytensor.tensor.blas.blas_c import CGemv, CGer, must_initialize_y_gemv
-from pytensor.tensor.blas.gemm import _dot22, _dot22scalar, gemm_no_inplace
+from pytensor.tensor.blas.gemm import (
+    _dot22,
+    _dot22scalar,
+    gemm_inplace,
+    gemm_no_inplace,
+)
 from pytensor.tensor.type import (
     dmatrix,
     dscalar,
@@ -513,3 +518,30 @@ def test_blas_c_code_is_dtype_specialized(name, op_inputs):
     assert "NPY_FLOAT" not in code
     assert single not in code
     assert double in code
+
+
+@pytest.mark.parametrize(
+    "ops_inputs",
+    [
+        lambda: (
+            gemm_inplace,
+            gemm_no_inplace,
+            [dmatrix(), dscalar(), dmatrix(), dmatrix(), dscalar()],
+        ),
+        lambda: (
+            CGemv(inplace=True),
+            CGemv(inplace=False),
+            [dvector(), dscalar(), dmatrix(), dvector(), dscalar()],
+        ),
+    ],
+)
+def test_blas_c_code_inplace_is_specialized(ops_inputs):
+    # inplace is a static op prop, so each variant emits only its own
+    # output-setup arm, with no runtime params branch.
+    op_inplace, op_outplace, inputs = ops_inputs()
+    code_inplace = _emit_c_code(op_inplace, inputs)
+    code_outplace = _emit_c_code(op_outplace, inputs)
+    for code in (code_inplace, code_outplace):
+        assert "->inplace" not in code
+        assert "params" not in code
+    assert code_inplace != code_outplace

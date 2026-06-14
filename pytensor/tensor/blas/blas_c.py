@@ -59,10 +59,6 @@ cger_no_inplace = CGer(False)
 
 
 class CGemv(BaseBLAS, Gemv):
-    params_type = ParamsType(
-        inplace=bool_t,
-    )
-
     def __init__(self, inplace):
         super().__init__(inplace)
 
@@ -70,7 +66,7 @@ class CGemv(BaseBLAS, Gemv):
         return gemv_c_code(node, name, inp, out, sub)
 
     def c_code_cache_version(self):
-        return (19, blas_header_version(), must_initialize_y_gemv())
+        return (21, blas_header_version(), must_initialize_y_gemv())
 
 
 cgemv_inplace = CGemv(inplace=True)

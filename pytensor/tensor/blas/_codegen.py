@@ -375,13 +375,8 @@ def gemm_c_code(node, name, inputs, outputs, sub):
         f"{ctype} a = (({ctype}*)PyArray_DATA(%(_a)s))[0];\n"
         f"            {ctype} b = (({ctype}*)PyArray_DATA(%(_b)s))[0];"
     )
-    setup_z = (
-        "if(%(params)s->inplace){"
-        + _GEMM_SETUP_Z_INPLACE
-        + "}else{"
-        + _GEMM_SETUP_Z_OUTPLACE
-        + "}"
-    )
+    # inplace is a static op prop, so emit only the relevant output setup.
+    setup_z = _GEMM_SETUP_Z_INPLACE if node.op.inplace else _GEMM_SETUP_Z_OUTPLACE
     code = "".join(
         (
             _DECLARE_NS,
@@ -629,13 +624,8 @@ def gemv_c_code(node, name, inputs, outputs, sub):
     y, alpha, A, x, beta = inputs
     (z,) = outputs
     ctype, prec, elemsize = _check_blas_dtype(node.inputs[0].type.dtype, "CGemv")
-    setup_z = (
-        "if (!%(params)s->inplace) {"
-        + _GEMV_SETUP_Z_OUTPLACE
-        + "} else {"
-        + _GEMV_SETUP_Z_INPLACE
-        + "}"
-    )
+    # inplace is a static op prop, so emit only the relevant output setup.
+    setup_z = _GEMV_SETUP_Z_INPLACE if node.op.inplace else _GEMV_SETUP_Z_OUTPLACE
     code = _GEMV_CODE.replace("__SETUP_Z__", setup_z)
     return code % dict(
         y=y,
