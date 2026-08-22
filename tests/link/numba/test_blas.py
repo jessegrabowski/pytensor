@@ -84,7 +84,11 @@ def test_gemm_inplace_writes_through_its_accumulator():
     np.testing.assert_allclose(z.get_value(), expected, rtol=1e-5)
 
 
-@pytest.mark.parametrize("A_shape", [(6, 5), (1, 5)], ids=["full", "broadcast_row"])
+@pytest.mark.parametrize(
+    "A_shape",
+    [(6, 5), (1, 5), (6, 1), (1, 1)],
+    ids=["full", "broadcast_row", "broadcast_column", "broadcast_both"],
+)
 def test_ger_broadcasts_its_accumulator(A_shape):
     """``Ger`` takes an ``A`` that is only broadcast against the outer product, so the buffer the
     update writes into is the product's shape, not ``A``'s."""
