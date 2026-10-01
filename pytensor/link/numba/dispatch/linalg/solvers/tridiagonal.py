@@ -83,7 +83,7 @@ def gttrf_impl(
     ) -> tuple[ndarray, ndarray, ndarray, ndarray, ndarray, int]:
         n = np.int32(d.shape[-1])
         ipiv = np.empty(n, dtype=np.int32)
-        du2 = np.empty(n - 2, dtype=dtype)
+        du2 = np.empty(max(int(n) - 2, 0), dtype=dtype)
         info = val_to_int_ptr(0)
 
         if not overwrite_dl or not dl.flags.f_contiguous:
@@ -307,7 +307,7 @@ def numba_funcify_LUFactorTridiagonal(op: LUFactorTridiagonal, node, **kwargs):
         )
         return dl, d, du, du2, ipiv
 
-    cache_version = 3
+    cache_version = 4
     return lu_factor_tridiagonal, cache_version
 
 
