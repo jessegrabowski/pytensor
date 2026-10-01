@@ -3,9 +3,18 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from pytensor.gradient import DisconnectedType
 from pytensor.graph import Apply, Op
 from pytensor.tensor import math as ptm
-from pytensor.tensor.basic import as_tensor, diagonal
+from pytensor.tensor.basic import (
+    arange,
+    as_tensor,
+    concatenate,
+    diagonal,
+    ones_like,
+    where,
+    zeros_like,
+)
 from pytensor.tensor.blockwise import Blockwise
 from pytensor.tensor.linalg._lazy import scipy_linalg
 from pytensor.tensor.type import tensor, vector
@@ -119,6 +128,71 @@ class LUFactorTridiagonal(Op):
         output_storage[3][0] = du2[: max(n - 2, 0)]
         output_storage[4][0] = ipiv[:n]
 
+    def pullback(self, inputs, outputs, output_grads):
+        """Reverse-mode gradient of gttrf, holding the pivot sequence fixed.
+
+        Reversing the elimination carries the cotangents of the running pivot
+        ``d[i + 1]`` and of the fill-in slot ``du[i + 1]`` from step i back to step
+        i - 1. Eliminating the fill-in carry leaves a second order linear recurrence in
+        the pivot carry, which is a unit upper triangular system with two
+        superdiagonals.
+        """
+        dl, d, du, du2, ipiv = outputs
+        dl_bar, d_bar, du_bar, du2_bar = (
+            zeros_like(output) if isinstance(grad.type, DisconnectedType) else grad
+            for output, grad in zip(outputs[:4], output_grads[:4], strict=True)
+        )
+
+        n = d.shape[0]
+        swap = ptm.neq(ipiv[:-1], arange(1, n))
+        pivots = d[:-1]
+
+        # The fill-in carry entering step i is
+        # fill_scale[i + 1] * pivot_carry[i + 2] + fill_offset[i + 1]
+        fill_scale = where(swap, 1, -dl)
+        fill_offset = where(swap, 0, du_bar)
+
+        carry_du = where(swap, du / pivots, -du * dl / pivots)
+        carry_du2 = where(swap[:-1], du2 * fill_scale[1:] / pivots[:-1], 0)
+        carry_rhs = where(
+            swap,
+            dl_bar[:-1].inc(-du2 * fill_offset[1:]) / pivots,
+            d_bar[:-1] - dl_bar * dl / pivots,
+        )
+        pivot_carry = SolveLUFactorTridiagonal(b_ndim=1, transposed=False)(
+            zeros_like(dl),
+            ones_like(d),
+            carry_du,
+            carry_du2,
+            arange(1, n + 1, dtype="int32"),
+            concatenate([carry_rhs, d_bar[-1:]]),
+        )
+
+        next_pivot_carry = pivot_carry[1:]
+        fill_carry = fill_scale * next_pivot_carry + fill_offset
+
+        multiplier_bar = (dl_bar - next_pivot_carry * du)[:-1].inc(
+            -where(swap[:-1], fill_carry[1:] * du2, 0)
+        )
+        dl_in_bar = where(
+            swap,
+            d_bar[:-1] - multiplier_bar * dl / pivots,
+            multiplier_bar / pivots,
+        )
+        d_in_bar = concatenate(
+            [
+                pivot_carry[:1],
+                where(swap, du_bar - next_pivot_carry * dl, next_pivot_carry),
+            ]
+        )
+        du_in_bar = concatenate(
+            [
+                fill_carry[:1],
+                where(swap[:-1], du2_bar - fill_carry[1:] * dl[:-1], fill_carry[1:]),
+            ]
+        )
+        return [dl_in_bar, d_in_bar, du_in_bar]
+
 
 class SolveLUFactorTridiagonal(Op):
     """Solve a system of linear equations with a tridiagonal coefficient matrix (lapack gttrs)."""
@@ -220,6 +294,73 @@ class SolveLUFactorTridiagonal(Op):
             trans="N" if not self.transposed else "T",
         )
         output_storage[0][0] = x[:n]
+
+    def pullback(self, inputs, outputs, output_grads):
+        """Reverse-mode gradient of gttrs.
+
+        With ``A = P L U``, gttrs runs an L stage of pivoted row operations with
+        multipliers ``dl`` and a banded U stage. The U cotangents are band products of
+        the U stage solution and the cotangent of its right-hand side. The ``dl``
+        cotangents depend on the values carried between rows in the L stage and on
+        their cotangents. Each carry is a first order linear recurrence, which is a
+        bidiagonal solve.
+        """
+        dl, d, du, du2, ipiv, b = inputs
+        [x] = outputs
+        [x_bar] = output_grads
+
+        b_bar = type(self)(b_ndim=self.b_ndim, transposed=not self.transposed)(
+            dl, d, du, du2, ipiv, x_bar
+        )
+        b_bar_out = b_bar
+        if self.b_ndim == 1:
+            b, x, x_bar, b_bar = (v[:, None] for v in (b, x, x_bar, b_bar))
+
+        n = d.shape[0]
+        swap = ptm.neq(ipiv[:-1], arange(1, n))[:, None]
+
+        # With no multipliers and no row swaps, gttrs only runs its banded U stage
+        no_dl = zeros_like(dl)
+        no_swaps = arange(1, n + 1, dtype="int32")
+        u_solve = SolveLUFactorTridiagonal(b_ndim=2, transposed=False)
+        ut_solve = SolveLUFactorTridiagonal(b_ndim=2, transposed=True)
+        carry_factors = (
+            no_dl,
+            ones_like(d),
+            where(swap[:, 0], -1, dl),
+            zeros_like(du2),
+            no_swaps,
+        )
+
+        if not self.transposed:
+            # x = U^-1 y, where y is the output of the L stage
+            y_bar = ut_solve(no_dl, d, du, du2, no_swaps, x_bar)
+            y = (d[:, None] * x)[:-1].inc(du[:, None] * x[1:])
+            y = y[:-2].inc(du2[:, None] * x[2:])
+
+            carry_bar = u_solve(
+                *carry_factors, y_bar[:-1].set(where(swap, 0, y_bar[:-1]))
+            )
+            dl_bar = (carry_bar[1:] * y[:-1]).sum(-1)
+            outer_left, outer_right = y_bar, x
+        else:
+            # z = U^-T b is the input of the L stage
+            z = ut_solve(no_dl, d, du, du2, no_swaps, b)
+
+            carry = u_solve(*carry_factors, z[:-1].set(where(swap, 0, z[:-1])))
+            carry_bar = ut_solve(
+                *carry_factors,
+                x_bar[1:].set(where(swap, -dl[:, None] * x_bar[1:], x_bar[1:])),
+            )
+            dl_bar = (where(swap, x_bar[1:], carry_bar[:-1]) * carry[1:]).sum(-1)
+            outer_left, outer_right = z, b_bar
+
+        # The U cotangent is -outer_left @ outer_right.T, restricted to the band of U
+        d_bar = (outer_left * outer_right).sum(-1)
+        du_bar = (outer_left[:-1] * outer_right[1:]).sum(-1)
+        du2_bar = (outer_left[:-2] * outer_right[2:]).sum(-1)
+
+        return [-dl_bar, -d_bar, -du_bar, -du2_bar, DisconnectedType()(), b_bar_out]
 
 
 def tridiagonal_lu_factor(

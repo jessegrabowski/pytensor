@@ -158,3 +158,19 @@ def test_cast_needed():
         ],
         eval_obj_mode=False,
     )
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_tridiagonal_small_systems(n):
+    dl, d, du = (pt.dvector(name) for name in ("dl", "d", "du"))
+    b = pt.dmatrix("b")
+    factors = LUFactorTridiagonal()(dl, d, du)
+    x = SolveLUFactorTridiagonal(b_ndim=2, transposed=False)(*factors, b)
+
+    rng = np.random.default_rng(n)
+    compare_numba_and_py(
+        [dl, d, du, b],
+        [*factors, x, *pt.grad(x.sum(), [dl, d, du, b])],
+        test_inputs=[rng.normal(size=size) for size in (n - 1, n, n - 1, (n, 3))],
+        eval_obj_mode=False,
+    )

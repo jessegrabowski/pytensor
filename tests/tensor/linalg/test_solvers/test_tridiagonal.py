@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import scipy
 
+import pytensor
 from pytensor import function
 from pytensor import tensor as pt
 from pytensor.tensor.linalg.solvers.tridiagonal import (
@@ -76,3 +77,46 @@ class TestTridiagonalLU(utt.InferShapeTester):
             A_val = np.diag(d_val) + np.diag(dl_val, -1) + np.diag(du_val, 1)
             expected = scipy.linalg.solve(A_val.T if transposed else A_val, b_val)
             np.testing.assert_allclose(f(dl_val, d_val, du_val, b_val), expected)
+
+    def test_lu_factor_grad(self):
+        rng = np.random.default_rng(utt.fetch_seed())
+        weights = [rng.normal(size=size) for size in (8, 9, 8, 7)]
+
+        def cost(dl, d, du):
+            factors = LUFactorTridiagonal()(dl, d, du)[:4]
+            return sum(
+                (w * factor).sum() for w, factor in zip(weights, factors, strict=True)
+            )
+
+        utt.verify_grad(cost, list(tridiagonal_test_values(9, rng)), rng=rng)
+
+    @pytest.mark.parametrize("transposed", [False, True])
+    @pytest.mark.parametrize("b_ndim", [1, 2])
+    def test_solve_grad(self, b_ndim, transposed):
+        rng = np.random.default_rng(utt.fetch_seed())
+        dl, d, du, du2, ipiv, _ = scipy.linalg.lapack.dgttrf(
+            *tridiagonal_test_values(9, rng)
+        )
+        b = rng.normal(size=(9, 3)[:b_ndim])
+
+        def solve(dl, d, du, du2, b):
+            return SolveLUFactorTridiagonal(b_ndim=b_ndim, transposed=transposed)(
+                dl, d, du, du2, ipiv, b
+            )
+
+        utt.verify_grad(solve, [dl, d, du, du2, b], rng=rng)
+
+    @pytest.mark.parametrize("transposed", [False, True])
+    def test_grad_small_systems(self, transposed):
+        dl, d, du = (pt.dvector(name) for name in ("dl", "d", "du"))
+        b = pt.dmatrix("b")
+        x = SolveLUFactorTridiagonal(b_ndim=2, transposed=transposed)(
+            *LUFactorTridiagonal()(dl, d, du), b
+        )
+        f = function([dl, d, du, b], pytensor.grad(x.sum(), [d, b]))
+
+        for n in [0, 1]:
+            d_bar, b_bar = f(np.zeros(0), np.full(n, 2.0), np.zeros(0), np.ones((n, 3)))
+            # A = 2 I, so x = b / 2 and each of the 3 columns contributes -1 / 2**2
+            np.testing.assert_allclose(d_bar, np.full(n, -3 / 2**2))
+            np.testing.assert_allclose(b_bar, np.full((n, 3), 1 / 2))
