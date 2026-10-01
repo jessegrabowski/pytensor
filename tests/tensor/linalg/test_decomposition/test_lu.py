@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import scipy
 
-from pytensor import function
+from pytensor import function, grad
 from pytensor.configdefaults import config
 from pytensor.tensor.linalg import lu, lu_factor, pivot_to_permutation
 from pytensor.tensor.type import matrix, tensor
@@ -135,3 +135,21 @@ def test_lu_factor_empty():
     assert LU.size == 0
     assert LU.dtype == config.floatX
     assert pt_p_idx.size == 0
+
+
+def test_lu_factor_discrete_input():
+    A = matrix(dtype="int64")
+    LU, _ = lu_factor(A)
+    assert LU.type.dtype == "float64"
+
+    A_val = np.array([[2, 1], [4, 3]])
+    np.testing.assert_allclose(
+        function([A], LU)(A_val), scipy.linalg.lu_factor(A_val)[0]
+    )
+
+
+def test_lu_factor_pivots_only_grad():
+    A = matrix()
+    _, pivots = lu_factor(A)
+    A_bar = grad(pivots.sum(), A, disconnected_inputs="ignore")
+    np.testing.assert_allclose(A_bar.eval({A: np.eye(3, dtype=A.dtype)}), 0)

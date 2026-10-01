@@ -218,6 +218,12 @@ class PivotToPermutations(Op):
         permutations = pivots.type.clone(dtype="int64")()
         return Apply(self, [pivots], [permutations])
 
+    def infer_shape(self, node, shapes):
+        return shapes
+
+    def connection_pattern(self, node):
+        return [[False]]
+
     def perform(self, node, inputs, outputs):
         [pivots] = inputs
         p_inv = np.arange(len(pivots), dtype="int64")
@@ -253,7 +259,7 @@ class LUFactor(Op):
                 f"LU only allowed on matrix (2-D) inputs, got {A.type.ndim}-D input"
             )
 
-        LU = matrix(shape=A.type.shape, dtype=A.type.dtype)
+        LU = matrix(shape=A.type.shape, dtype=linalg_output_dtype(A.type.dtype))
         pivots = vector(shape=(A.type.shape[0],), dtype="int32")
 
         return Apply(self, [A], [LU, pivots])
@@ -261,6 +267,9 @@ class LUFactor(Op):
     def infer_shape(self, node, shapes):
         n = shapes[0][0]
         return [(n, n), (n,)]
+
+    def connection_pattern(self, node):
+        return [[True, False]]
 
     def inplace_on_inputs(self, allowed_inplace_inputs: list[int]) -> "Op":
         if 0 in allowed_inplace_inputs:
@@ -272,14 +281,15 @@ class LUFactor(Op):
 
     def perform(self, node, inputs, outputs):
         A = inputs[0]
+        dtype = node.outputs[0].type.dtype
 
         # Quick return for empty arrays
         if A.size == 0:
-            outputs[0][0] = np.empty_like(A)
+            outputs[0][0] = np.empty_like(A, dtype=dtype)
             outputs[1][0] = np.array([], dtype=np.int32)
             return
 
-        (getrf,) = scipy_linalg.get_lapack_funcs(("getrf",), (A,))
+        (getrf,) = scipy_linalg.get_lapack_funcs(("getrf",), dtype=dtype)
         LU, p, info = getrf(A, overwrite_a=self.overwrite_a)
         if info != 0:
             LU[...] = np.nan
@@ -338,7 +348,7 @@ def lu_factor(
     LU: TensorVariable
         LU decomposition of `a`
     pivots: TensorVariable
-        An array of integers representin the pivot indices
+        An array of integers representing the pivot indices
     """
 
     return cast(
