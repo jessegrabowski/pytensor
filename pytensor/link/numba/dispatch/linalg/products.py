@@ -390,6 +390,33 @@ def _blas_operand(X):
     return np.ascontiguousarray(X), True, np.int32(max(1, X.shape[1]))
 
 
+@numba_basic.numba_njit(inline="always")
+def _column_major_operand(X):
+    return X, False, np.int32(max(1, X.shape[0]))
+
+
+@numba_basic.numba_njit(inline="always")
+def _row_major_operand(X):
+    return X, True, np.int32(max(1, X.shape[1]))
+
+
+# Contiguous array types fix the BLAS transpose flag and leading dimension
+_OPERAND_BY_LAYOUT = {"F": _column_major_operand, "C": _row_major_operand}
+
+
+@numba_basic.numba_njit(inline="always")
+def _pair_reversed_contraction(A, B):
+    # Reversing the contraction axis of both operands leaves the product unchanged
+    if _is_reversed(A, 1) and _is_reversed(B, 0):
+        return A[:, ::-1], B[::-1]
+    return A, B
+
+
+@numba_basic.numba_njit(inline="always")
+def _keep_operands(A, B):
+    return A, B
+
+
 # Stack slots; a one-element array would cost a heap allocation per call
 _SCALAR_PTR_INTRINSICS = {
     types.float32: val_to_sptr,
@@ -598,6 +625,78 @@ def _gemm_impl(A, B, C):
     numba_gemm = _BLAS().numba_xgemm(dtype)
     scalar_ptr = _SCALAR_PTR_INTRINSICS[dtype]
 
+    @numba_basic.numba_njit(inline="always")
+    def call_gemm(A_work, A_trans, LDA, B_work, B_trans, LDB, C_work, LDC, M, N, K):
+        numba_gemm(
+            val_to_int_ptr(ord("T") if A_trans else ord("N")),
+            val_to_int_ptr(ord("T") if B_trans else ord("N")),
+            val_to_int_ptr(M),
+            val_to_int_ptr(N),
+            val_to_int_ptr(K),
+            scalar_ptr(1.0),
+            A_work.ctypes,
+            val_to_int_ptr(LDA),
+            B_work.ctypes,
+            val_to_int_ptr(LDB),
+            scalar_ptr(0.0),
+            C_work.ctypes,
+            val_to_int_ptr(np.int32(LDC)),
+        )
+
+    if C.layout in "CF":
+        # A contiguous C is written in place, so only operands typed with an
+        # arbitrary layout need their strides inspected at runtime.
+        operand_a = _OPERAND_BY_LAYOUT.get(A.layout, _blas_operand)
+        operand_b = _OPERAND_BY_LAYOUT.get(B.layout, _blas_operand)
+        pair_contraction = (
+            _pair_reversed_contraction
+            if A.layout == "A" and B.layout == "A"
+            else _keep_operands
+        )
+        c_row_major = C.layout == "C"
+
+        def contiguous_output_impl(A, B, C):
+            M = np.int32(A.shape[0])
+            K = np.int32(A.shape[1])
+            N = np.int32(B.shape[1])
+            if B.shape[0] != K:
+                raise ValueError(
+                    "gemm: operands have mismatched contraction dimensions"
+                )
+            if C.shape[0] != M or C.shape[1] != N:
+                raise ValueError("gemm: output shape does not match the product")
+            if M == 0 or N == 0:
+                return C
+            if K == 0:
+                C[:] = 0
+                return C
+
+            A, B = pair_contraction(A, B)
+            A_work, A_trans, LDA = operand_a(A)
+            B_work, B_trans, LDB = operand_b(B)
+            if c_row_major:
+                # C^T = op(B)^T op(A)^T, so the operands swap and each flag flips
+                call_gemm(
+                    B_work,
+                    not B_trans,
+                    LDB,
+                    A_work,
+                    not A_trans,
+                    LDA,
+                    C,
+                    max(1, N),
+                    N,
+                    M,
+                    K,
+                )
+            else:
+                call_gemm(
+                    A_work, A_trans, LDA, B_work, B_trans, LDB, C, max(1, M), M, N, K
+                )
+            return C
+
+        return contiguous_output_impl
+
     def impl(A, B, C):
         out = C
         M = np.int32(A.shape[0])
@@ -616,13 +715,6 @@ def _gemm_impl(A, B, C):
         if K == 0:
             C[:] = 0
             return out
-        if N == 1:
-            _gemv(A, B[:, 0], C[:, 0])
-            return out
-        if M == 1:
-            _gemv(B.T, A[0], C[0])
-            return out
-
         A, B, C = _normalize_gemm_strides(A, B, C)
         A_work, A_trans, LDA = _blas_operand(A)
         B_work, B_trans, LDB = _blas_operand(B)
@@ -649,23 +741,11 @@ def _gemm_impl(A, B, C):
             LDA, LDB = LDB, LDA
             M, N = N, M
 
-        numba_gemm(
-            val_to_int_ptr(ord("T") if A_trans else ord("N")),
-            val_to_int_ptr(ord("T") if B_trans else ord("N")),
-            val_to_int_ptr(M),
-            val_to_int_ptr(N),
-            val_to_int_ptr(K),
-            scalar_ptr(1.0),
-            A_work.ctypes,
-            val_to_int_ptr(LDA),
-            B_work.ctypes,
-            val_to_int_ptr(LDB),
-            scalar_ptr(0.0),
-            C_work.ctypes,
-            val_to_int_ptr(np.int32(LDC)),
-        )
+        call_gemm(A_work, A_trans, LDA, B_work, B_trans, LDB, C_work, LDC, M, N, K)
         if C_work is not C:
-            C[:] = C_work
+            for i in range(C.shape[0]):
+                for j in range(C.shape[1]):
+                    C[i, j] = C_work[i, j]
         return out
 
     return impl
