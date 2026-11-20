@@ -1,5 +1,6 @@
 from itertools import chain
 
+from pytensor.assumptions import DIAGONAL, check_assumption
 from pytensor.compile import optdb
 from pytensor.graph import ancestors
 from pytensor.graph.rewriting.basic import (
@@ -8,9 +9,11 @@ from pytensor.graph.rewriting.basic import (
     node_rewriter,
 )
 from pytensor.tensor import TensorVariable
-from pytensor.tensor.basic import constant
+from pytensor.tensor.basic import concatenate, constant, diagonal
 from pytensor.tensor.elemwise import DimShuffle
 from pytensor.tensor.extra_ops import broadcast_to
+from pytensor.tensor.math import sqrt
+from pytensor.tensor.random.basic import MvNormalRV, normal
 from pytensor.tensor.random.op import RandomVariable, RNGConsumerOp
 from pytensor.tensor.random.utils import broadcast_params
 from pytensor.tensor.rewriting.basic import (
@@ -383,3 +386,23 @@ def sidestep_unused_rng_consumer(fgraph, node):
 
     # Bypass: map each RNG output back to its corresponding RNG input
     return {rng_out: rng_in for rng_in, rng_out in update_map.items()}
+
+
+@register_canonicalize("random_unsafe")
+@register_stabilize("random_unsafe")
+@node_rewriter([MvNormalRV])
+def mvnormal_of_diag_to_normal(fgraph, node):
+    """multivariate_normal(mu, D) -> normal(mu, sqrt(diagonal(D))) for diagonal D."""
+    rng, size, mean, cov = node.inputs
+
+    if not check_assumption(fgraph, cov, DIAGONAL):
+        return None
+
+    if not isinstance(size.type, NoneTypeT):
+        size = concatenate([size, cov.shape[-1:]])
+
+    sigma = sqrt(diagonal(cov, axis1=-2, axis2=-1))
+    next_rng, draw = normal.make_node(rng, size, mean, sigma).outputs
+    new_outputs = [next_rng, draw.astype(node.outputs[1].dtype)]
+    copy_stack_trace(node.outputs, new_outputs)
+    return new_outputs

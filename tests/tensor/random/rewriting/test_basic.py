@@ -36,13 +36,17 @@ from pytensor.tensor.random.rewriting import (
     local_rv_size_lift,
     local_subtensor_rv_lift,
 )
-from pytensor.tensor.random.rewriting.basic import sidestep_unused_rng_consumer
+from pytensor.tensor.random.rewriting.basic import (
+    mvnormal_of_diag_to_normal,
+    sidestep_unused_rng_consumer,
+)
 from pytensor.tensor.random.rewriting.numba import introduce_explicit_core_shape_rv
 from pytensor.tensor.random.type import random_generator_type
 from pytensor.tensor.rewriting.shape import ShapeFeature, ShapeOptimizer
 from pytensor.tensor.subtensor import AdvancedSubtensor, Subtensor
 from pytensor.tensor.type import iscalar
 from pytensor.tensor.type_other import NoneConst
+from tests.unittest_tools import RewriteTester
 
 
 no_mode = Mode("py", RewriteDatabaseQuery(include=[], exclude=[]))
@@ -1070,3 +1074,47 @@ def test_unused_rng():
             fn_excluding.maker.fgraph.outputs,
             expected,
         )
+
+
+@pytest.mark.parametrize("size", [None, (2,)], ids=["no_size", "size"])
+def test_mvnormal_of_diag_to_normal(size):
+    rng = random_generator_type("rng")
+    mu = pt.dvector("mu", shape=(3,))
+    d = pt.dvector("d", shape=(3,))
+    cov = pt.diag(d)
+    out = multivariate_normal(mu, cov, size=size, rng=rng)
+
+    result = RewriteTester(
+        [rng, mu, d],
+        [out],
+        include=None,
+        custom_rewrite=mvnormal_of_diag_to_normal,
+    )
+    _, rv_size, rv_mu, rv_cov = out.owner.inputs
+    normal_size = None if size is None else pt.concatenate([rv_size, rv_cov.shape[-1:]])
+    result.assert_graph(
+        normal(
+            rv_mu,
+            pt.sqrt(pt.diagonal(rv_cov, axis1=-2, axis2=-1)),
+            size=normal_size,
+            rng=rng,
+        )
+    )
+    result.assert_eval(
+        np.random.default_rng(1), np.arange(3.0), np.array([1.0, 4.0, 9.0])
+    )
+
+
+def test_mvnormal_of_diag_to_normal_dense_cov():
+    rng = random_generator_type("rng")
+    mu = pt.dvector("mu")
+    cov = pt.dmatrix("cov")
+    out = multivariate_normal(mu, cov, rng=rng)
+
+    result = RewriteTester(
+        [rng, mu, cov],
+        [out],
+        include=None,
+        custom_rewrite=mvnormal_of_diag_to_normal,
+    )
+    result.assert_graph(out)
